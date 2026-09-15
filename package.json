@@ -1,6 +1,6 @@
 {
   "name": "pi-prefix-cache-compaction",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi compaction that reuses the server's prefix cache (vLLM / SGLang / llama.cpp Anthropic endpoints): no cold re-prefill of the history, thinking off for the summary, and a warm-up so the next turn starts from cache.",
   "type": "module",
   "license": "MIT",

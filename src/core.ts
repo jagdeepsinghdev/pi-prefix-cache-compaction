@@ -15,7 +15,12 @@ export interface Config {
 	minSummaryTokens: number;
 	/** Tokens reserved for the appended instruction and chat-template overhead. */
 	promptOverheadTokens: number;
-	/** Send thinking disabled (+ vLLM chat_template_kwargs) for the summary request. */
+	/**
+	 * Force thinking off for the summary request. Default false: many chat templates
+	 * (Qwen3.x among them) put the reasoning-effort text at the START of the system
+	 * prompt, so changing thinking changes the whole prefix and the cache misses.
+	 * Only enable for templates where thinking affects the generation prompt alone.
+	 */
 	disableThinking: boolean;
 	/** After compaction, send a 1-token request with the new context so the next turn starts warm. */
 	warmup: boolean;
@@ -27,10 +32,10 @@ export const DEFAULT_CONFIG: Config = {
 	providers: [],
 	baseUrlIncludes: [],
 	baseUrlExcludes: ["api.anthropic.com"],
-	maxSummaryTokens: 12_000,
+	maxSummaryTokens: 16_000,
 	minSummaryTokens: 4_000,
 	promptOverheadTokens: 3_000,
-	disableThinking: true,
+	disableThinking: false,
 	warmup: true,
 	notify: true,
 };
@@ -124,11 +129,12 @@ Use this EXACT format:
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages. Output ONLY the summary.`;
+Keep each section concise. Preserve exact file paths, function names, and error messages. Keep any reasoning brief. Output ONLY the summary.`;
 
 /**
  * The captured request, unchanged up to its last message, plus one instruction.
  * Identical prefix => the server's prefix cache covers everything but the instruction.
+ * Thinking fields are kept as captured unless cfg.disableThinking (see Config).
  */
 export function buildSummaryBody(captured: Record<string, any>, maxTokens: number, cfg: Config): Record<string, any> {
 	const body: Record<string, any> = {
@@ -178,6 +184,7 @@ export class SummaryError extends Error {}
 export class SseCollector {
 	private buf = "";
 	text = "";
+	thinkingChars = 0;
 	stopReason = "";
 	usage: Record<string, number> = {};
 
@@ -215,6 +222,7 @@ export class SseCollector {
 					break;
 				case "content_block_delta":
 					if (ev.delta?.type === "text_delta") this.text += ev.delta.text;
+					else if (ev.delta?.type === "thinking_delta") this.thinkingChars += String(ev.delta.thinking ?? "").length;
 					break;
 				case "message_start":
 					Object.assign(this.usage, ev.message?.usage ?? {});
@@ -245,10 +253,8 @@ export function fileListSuffix(fileOps: { read?: Iterable<string>; edited?: Iter
  * everything else (system, tools, sampling fields) is the captured request verbatim.
  */
 export function buildWarmupBody(captured: Record<string, any>, built: Record<string, any>): Record<string, any> {
-	// Thinking only changes the generation prompt after the last message, never the prefix;
-	// disabling it avoids thinking-budget vs max_tokens validation on a 1-token request.
-	const body: Record<string, any> = { ...captured, messages: built.messages, max_tokens: 1, stream: built.stream ?? true };
-	body.thinking = { type: "disabled" };
-	delete body.output_config;
-	return body;
+	// Thinking fields stay as captured: in templates that render reasoning effort into the
+	// system prompt, changing them would warm a different prefix than the next real turn.
+	// A 1-token request is fine: the server stops at max_tokens, thinking or not.
+	return { ...captured, messages: built.messages, max_tokens: 1, stream: built.stream ?? true };
 }

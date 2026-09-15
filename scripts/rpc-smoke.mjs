@@ -6,7 +6,7 @@
  * Isolated: uses a temporary PI_CODING_AGENT_DIR containing only your models.json (and
  * auth.json if present) plus this extension, so other installed extensions do not interfere.
  *
- *   node scripts/rpc-smoke.mjs --provider qwen-local --model qwen3.8-27b [--no-warmup]
+ *   node scripts/rpc-smoke.mjs --provider qwen-local --model qwen3.8-27b [--thinking xhigh] [--no-warmup]
  *
  * Exit code 0 only if the compaction came from this extension.
  */
@@ -24,6 +24,7 @@ const opt = (name, def) => {
 const provider = opt("provider");
 const model = opt("model");
 const warmup = !args.includes("--no-warmup");
+const thinking = opt("thinking", "off");
 if (!provider || !model) {
 	console.error("usage: rpc-smoke.mjs --provider <id> --model <id> [--no-warmup] [--extra-extension <path>]");
 	process.exit(2);
@@ -44,7 +45,7 @@ for (const name of ["a.txt", "b.txt", "c.txt"]) {
 	writeFileSync(join(work, name), rows.join("\n"));
 }
 
-const piArgs = ["--mode", "rpc", "--provider", provider, "--model", model, "--thinking", "off", "--no-session", "-e", join(root, "src", "index.ts")];
+const piArgs = ["--mode", "rpc", "--provider", provider, "--model", model, "--thinking", thinking, "--no-session", "-e", join(root, "src", "index.ts")];
 const extra = opt("extra-extension");
 if (extra) piArgs.push("-e", resolve(extra));
 const pi = spawn(process.env.PI_BIN ?? "pi", piArgs, { cwd: work, env: { ...process.env, PI_CODING_AGENT_DIR: agent } });
@@ -102,7 +103,7 @@ try {
 	const answer = JSON.stringify(last?.messages?.at(-1)?.content ?? "").slice(0, 200);
 	console.log(el(), `first turn after compaction: ${after.toFixed(1)}s  answer: ${answer}`);
 	const fromExt = seen.some((e) => e.type === "extension_ui_request" && /Compaction done/.test(e.message ?? ""));
-	console.log(JSON.stringify({ warmup, compactSeconds: compactS, firstTurnAfterSeconds: after, fromExtension: fromExt, summaryChars: end?.result?.summary?.length }));
+	console.log(JSON.stringify({ thinking, warmup, compactSeconds: compactS, firstTurnAfterSeconds: after, fromExtension: fromExt, summaryChars: end?.result?.summary?.length }));
 	pi.kill();
 	process.exit(fromExt && r.success ? 0 : 1);
 } catch (err) {

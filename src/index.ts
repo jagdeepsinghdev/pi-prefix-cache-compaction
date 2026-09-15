@@ -9,7 +9,9 @@
  * This extension instead:
  *  1. captures each real provider request (before_provider_request),
  *  2. on compaction re-sends that exact request plus one summarize instruction,
- *     thinking disabled -> the prefix is served from cache,
+ *     thinking settings untouched -> the prefix is served from cache (Qwen-style
+ *     templates render reasoning effort into the system prompt, so changing thinking
+ *     would change the whole prefix),
  *  3. after compaction, optionally sends a 1-token warm-up with the new context so the
  *     next turn does not prefill the summary + kept messages cold.
  *
@@ -17,6 +19,8 @@
  * Technique credit: pisceslailai/deepseek-kvcache (MIT), adapted to Anthropic Messages.
  */
 import { existsSync, readFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -101,24 +105,14 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 		if (!budget) return fallback(ctx, "not enough room left in the context window");
 
 		const t0 = Date.now();
-		notify(ctx, `Compaction: reusing cached prefix (${preparation.tokensBefore.toLocaleString()} tokens), thinking off`);
+		notify(ctx, `Compaction: reusing cached prefix (${preparation.tokensBefore.toLocaleString()} tokens)`);
 		try {
-			const res = await fetch(messagesUrl(ctx.model?.baseUrl), {
-				method: "POST",
-				headers: requestHeaders(cap.headers, { "x-session-id": id }),
-				body: JSON.stringify(buildSummaryBody(cap.payload, budget, c)),
+			const { text, usage } = await streamMessages(
+				messagesUrl(ctx.model?.baseUrl),
+				requestHeaders(cap.headers, { "x-session-id": id }),
+				JSON.stringify(buildSummaryBody(cap.payload, budget, c)),
 				signal,
-			});
-			if (!res.ok || !res.body) {
-				const detail = (await res.text().catch(() => "")).slice(0, 160);
-				return fallback(ctx, `HTTP ${res.status} ${detail}`);
-			}
-			const sse = new SseCollector();
-			const decoder = new TextDecoder();
-			for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
-				sse.push(decoder.decode(chunk, { stream: true }));
-			}
-			const { text, usage } = sse.finish();
+			);
 			const secs = Math.round((Date.now() - t0) / 1000);
 			stats.compactions++;
 			stats.lastSeconds = secs;
@@ -178,6 +172,50 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 				"info",
 			);
 		},
+	});
+}
+
+class HttpStatusError extends Error {}
+
+/**
+ * POST and collect an Anthropic SSE stream with node:http, not fetch: fetch (undici)
+ * aborts a response that sends no bytes for 300 s ("terminated"), which is exactly what
+ * a long prefill or thinking phase on a local server looks like. Aborts only on `signal`.
+ */
+function streamMessages(url: string, headers: Record<string, string>, body: string, signal: AbortSignal) {
+	return new Promise<ReturnType<SseCollector["finish"]>>((resolve, reject) => {
+		const u = new URL(url);
+		const send = u.protocol === "https:" ? httpsRequest : httpRequest;
+		const req = send(u, { method: "POST", headers: { ...headers, "content-length": Buffer.byteLength(body) } }, (res) => {
+			const status = res.statusCode ?? 0;
+			const sse = new SseCollector();
+			let errBody = "";
+			res.setEncoding("utf8");
+			res.on("data", (chunk: string) => {
+				if (status >= 400) return void (errBody += chunk);
+				try {
+					sse.push(chunk);
+				} catch (err) {
+					req.destroy(err as Error);
+				}
+			});
+			res.on("end", () => {
+				if (status >= 400) return reject(new HttpStatusError(`HTTP ${status} ${errBody.slice(0, 160)}`));
+				try {
+					resolve(sse.finish());
+				} catch (err) {
+					reject(err);
+				}
+			});
+			res.on("error", reject);
+		});
+		req.setTimeout(0);
+		const onAbort = () => req.destroy(new Error("aborted"));
+		if (signal.aborted) return onAbort();
+		signal.addEventListener("abort", onAbort, { once: true });
+		req.on("error", reject);
+		req.on("close", () => signal.removeEventListener("abort", onAbort));
+		req.end(body);
 	});
 }
 

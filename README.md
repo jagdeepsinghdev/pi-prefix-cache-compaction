@@ -12,13 +12,17 @@ Measured on 2× RTX 3090 (vLLM, Qwen3.8-27B W4A16, TP=2), across 132 default com
 |---|---|---|
 | Tokens re-read cold per compaction | 142,106 | ~0 (prefix cache hit) |
 | Compaction time | 229 s (p90 489 s) | **86 s** at 215k context |
-| First turn after compaction | 69 s | **35 s**, less with warm-up |
+| First turn after compaction | 69 s | **35 s** without warm-up; **1.8 s** with warm-up (47k-token smoke test, thinking xhigh) |
 
 ## How it works
 
 1. **Capture.** Every real provider request is kept in memory (`before_provider_request`), per session.
-2. **Compact from cache.** On `session_before_compact` the extension re-sends that exact request (same system prompt, tools, messages, auth/routing headers) with one summarize instruction appended and thinking disabled. The prefix is byte-for-byte what the server just processed, so only the instruction is prefilled; the time left is generating the summary.
-3. **Warm-up.** After compaction, it sends a 1-token request with the new context (built by Pi's own converter, with the captured system prompt and tools), so the summary and kept messages are already cached when you send the next turn.
+2. **Compact from cache.** On `session_before_compact` the extension re-sends that exact request (same system prompt, tools, messages, thinking settings, auth/routing headers) with one summarize instruction appended. The prefix is byte-for-byte what the server just processed, so only the instruction is prefilled; the time left is generating the summary.
+3. **Warm-up.** After compaction, it sends a 1-token request with the new context (built by Pi's own converter, with the captured system prompt, tools and thinking settings), so the summary and kept messages are already cached when you send the next turn.
+
+**Why thinking is not turned off for the summary:** chat templates such as Qwen3.x write the reasoning-effort instruction at the *start* of the system prompt when thinking is on. Turning thinking off for the summary changes the first tokens of the prompt, and the cache misses completely (seen in practice: a 245k-token session re-prefilled cold for 5 minutes). The prompt asks for brief reasoning instead.
+
+The summary request uses `node:http` rather than `fetch`, because `fetch` gives up on a response that sends no bytes for 300 s, which a long prefill or thinking phase on a local GPU can do.
 
 Anything unexpected makes it step aside and Pi's default compaction runs: overflow recovery, no captured request yet (e.g. right after `/reload`), too little room left in the window, the model trying to call a tool, a truncated summary, or any HTTP/stream error.
 
@@ -53,10 +57,10 @@ Optional JSON, project overrides global:
   "providers": [],
   "baseUrlIncludes": [],
   "baseUrlExcludes": ["api.anthropic.com"],
-  "maxSummaryTokens": 12000,
+  "maxSummaryTokens": 16000,
   "minSummaryTokens": 4000,
   "promptOverheadTokens": 3000,
-  "disableThinking": true,
+  "disableThinking": false,
   "warmup": true,
   "notify": true
 }
@@ -64,13 +68,13 @@ Optional JSON, project overrides global:
 
 - `providers` / `baseUrlIncludes`: restrict to specific providers or endpoints (empty = every `anthropic-messages` model not excluded).
 - `baseUrlExcludes`: hosted Anthropic is excluded by default; it has its own caching rules.
-- `disableThinking`: sends `thinking: {type: "disabled"}` plus `chat_template_kwargs.enable_thinking: false` (what vLLM honors) for the summary.
+- `disableThinking` (default `false`): sends `thinking: {type: "disabled"}` plus `chat_template_kwargs.enable_thinking: false` for the summary. Only turn it on if your chat template changes nothing but the generation prompt when thinking flips; otherwise every compaction in a thinking-on session misses the cache.
 - The summary budget is `min(maxSummaryTokens, contextWindow − tokensBefore − promptOverheadTokens)`; below `minSummaryTokens` Pi's default runs instead.
 
 ## What you see
 
 ```
-Compaction: reusing cached prefix (215,275 tokens), thinking off
+Compaction: reusing cached prefix (215,275 tokens)
 Compaction done in 86s (4461 tokens out)
 Context re-warmed in Ns; next turn starts from cache
 ```
@@ -86,7 +90,7 @@ Context re-warmed in Ns; next turn starts from cache
 
 ```bash
 npm test                     # unit tests (node --test, no Pi needed)
-node scripts/rpc-smoke.mjs --provider <id> --model <id> [--no-warmup]
+node scripts/rpc-smoke.mjs --provider <id> --model <id> [--thinking xhigh] [--no-warmup]
 ```
 
 The smoke test runs Pi in RPC mode in an isolated agent directory against your real server, compacts a ~60k-token session and times the first turn after.

@@ -50,13 +50,13 @@ test("isCapturable: real turns yes, Pi's fallback summarizer and empty payloads 
 });
 
 test("summaryTokenBudget: capped, and refuses when the window is nearly full", () => {
-	assert.equal(summaryTokenBudget(262_144, 100_000, DEFAULT_CONFIG), 12_000);
+	assert.equal(summaryTokenBudget(262_144, 100_000, DEFAULT_CONFIG), 16_000);
 	assert.equal(summaryTokenBudget(262_144, 250_000, DEFAULT_CONFIG), 9_144);
 	assert.equal(summaryTokenBudget(262_144, 256_000, DEFAULT_CONFIG), undefined);
 	assert.equal(summaryTokenBudget(0, 1, DEFAULT_CONFIG), undefined);
 });
 
-test("buildSummaryBody: prefix untouched, one instruction appended, thinking off", () => {
+test("buildSummaryBody: prefix untouched, one instruction appended, thinking as captured", () => {
 	const captured = {
 		model: "m",
 		system: [{ type: "text", text: "sys" }],
@@ -79,23 +79,27 @@ test("buildSummaryBody: prefix untouched, one instruction appended, thinking off
 	assert.deepEqual(body.system, captured.system);
 	assert.deepEqual(body.tools, captured.tools);
 	assert.equal(body.max_tokens, 9000);
-	assert.deepEqual(body.thinking, { type: "disabled" });
-	assert.equal(body.output_config, undefined);
-	assert.equal(body.chat_template_kwargs.enable_thinking, false);
+	// default keeps thinking exactly as captured: Qwen-style templates render reasoning
+	// effort at the start of the system prompt, so changing it would miss the cache
+	assert.deepEqual(body.thinking, { type: "adaptive" });
+	assert.deepEqual(body.output_config, { effort: "xhigh" });
+	assert.equal(body.chat_template_kwargs, undefined);
 
-	const keep = buildSummaryBody(captured, 9000, mergeConfig({ disableThinking: false }));
-	assert.deepEqual(keep.thinking, { type: "adaptive" });
-	assert.equal(keep.chat_template_kwargs, undefined);
+	const off = buildSummaryBody(captured, 9000, mergeConfig({ disableThinking: true }));
+	assert.deepEqual(off.thinking, { type: "disabled" });
+	assert.equal(off.output_config, undefined);
+	assert.equal(off.chat_template_kwargs.enable_thinking, false);
 });
 
-test("buildWarmupBody: new messages, captured system/tools, 1 token", () => {
-	const captured = { system: "S", tools: [{ name: "t" }], messages: [{ role: "user", content: "old" }], output_config: { effort: "x" } };
+test("buildWarmupBody: new messages, captured system/tools/thinking, 1 token", () => {
+	const captured = { system: "S", tools: [{ name: "t" }], messages: [{ role: "user", content: "old" }], output_config: { effort: "x" }, thinking: { type: "adaptive" } };
 	const body = buildWarmupBody(captured, { messages: [{ role: "user", content: "new" }], system: "WRONG", stream: true });
 	assert.equal(body.system, "S");
 	assert.deepEqual(body.tools, [{ name: "t" }]);
 	assert.deepEqual(body.messages, [{ role: "user", content: "new" }]);
 	assert.equal(body.max_tokens, 1);
-	assert.equal(body.output_config, undefined);
+	assert.deepEqual(body.output_config, { effort: "x" }, "thinking config must not change the prefix");
+	assert.deepEqual(body.thinking, { type: "adaptive" });
 });
 
 test("requestHeaders: keeps auth, drops hop headers and non-strings, extra wins", () => {
@@ -127,6 +131,13 @@ test("SseCollector: text across arbitrary chunk splits, usage merged", () => {
 		assert.equal(r.usage.output_tokens, 4);
 		assert.equal(r.usage.input_tokens, 10);
 	}
+});
+
+test("SseCollector: thinking deltas are progress, not summary text", () => {
+	const c = new SseCollector();
+	c.push(sse({ type: "content_block_delta", delta: { type: "thinking_delta", thinking: "hmm" } }, { type: "content_block_delta", delta: { type: "text_delta", text: "## Goal" } }));
+	assert.equal(c.thinkingChars, 3);
+	assert.equal(c.finish().text, "## Goal");
 });
 
 test("SseCollector: CRLF frames parse", () => {
