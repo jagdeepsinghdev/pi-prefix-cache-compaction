@@ -10,6 +10,8 @@ import {
 	mergeConfig,
 	messagesUrl,
 	requestHeaders,
+	assertPrefixPreserved,
+	PrefixChangedError,
 	SseCollector,
 	SummaryError,
 	SUMMARY_PROMPT,
@@ -71,7 +73,7 @@ test("buildSummaryBody: prefix untouched, one instruction appended, thinking as 
 		max_tokens: 32000,
 	};
 	const snapshot = structuredClone(captured);
-	const body = buildSummaryBody(captured, 9000, DEFAULT_CONFIG);
+	const body = buildSummaryBody(captured, 9000);
 	assert.deepEqual(captured, snapshot, "captured payload must not be mutated");
 	assert.deepEqual(body.messages.slice(0, 2), captured.messages);
 	assert.equal(body.messages.length, 3);
@@ -85,21 +87,58 @@ test("buildSummaryBody: prefix untouched, one instruction appended, thinking as 
 	assert.deepEqual(body.output_config, { effort: "xhigh" });
 	assert.equal(body.chat_template_kwargs, undefined);
 
-	const off = buildSummaryBody(captured, 9000, mergeConfig({ disableThinking: true }));
-	assert.deepEqual(off.thinking, { type: "disabled" });
-	assert.equal(off.output_config, undefined);
-	assert.equal(off.chat_template_kwargs.enable_thinking, false);
+});
+
+test("assertPrefixPreserved: catches every field that could re-render the prompt", () => {
+	const captured = {
+		system: "s",
+		tools: [{ name: "read" }],
+		messages: [{ role: "user", content: "a" }],
+		thinking: { type: "adaptive" },
+		output_config: { effort: "xhigh" },
+		chat_template_kwargs: { enable_thinking: true },
+		reasoning_effort: "high",
+		model: "m",
+	};
+	const ok = buildSummaryBody(captured, 9000);
+	assert.doesNotThrow(() => assertPrefixPreserved(captured, ok, 1));
+	// sampling / streaming knobs never reach the prompt
+	assert.doesNotThrow(() => assertPrefixPreserved(captured, { ...ok, temperature: 0, stream: false, max_tokens: 5 }, 1));
+
+	const breaks: Array<[string, Record<string, unknown>]> = [
+		["thinking off (Anthropic)", { thinking: { type: "disabled" } }],
+		["enable_thinking (Qwen3)", { chat_template_kwargs: { enable_thinking: false } }],
+		["thinking flag (DeepSeek-V3.1 / Granite)", { chat_template_kwargs: { thinking: true } }],
+		["reasoning_effort (Gemma 4, vLLM injects enable_thinking)", { reasoning_effort: "none" }],
+		["effort (Pi output_config)", { output_config: { effort: "low" } }],
+		["system prompt", { system: "other" }],
+		["tools", { tools: [] }],
+		["tool_choice", { tool_choice: { type: "none" } }],
+		["model", { model: "other" }],
+	];
+	for (const [label, patch] of breaks) {
+		assert.throws(() => assertPrefixPreserved(captured, { ...ok, ...patch }, 1), PrefixChangedError, label);
+	}
+	assert.throws(() => assertPrefixPreserved(captured, { ...ok, messages: [{ role: "user", content: "changed" }, ok.messages[1]] }, 1), /message 0 changed/);
+	assert.throws(() => assertPrefixPreserved(captured, { ...ok, messages: [...ok.messages, { role: "user", content: "extra" }] }, 1), /message count/);
 });
 
 test("buildWarmupBody: new messages, captured system/tools/thinking, 1 token", () => {
 	const captured = { system: "S", tools: [{ name: "t" }], messages: [{ role: "user", content: "old" }], output_config: { effort: "x" }, thinking: { type: "adaptive" } };
-	const body = buildWarmupBody(captured, { messages: [{ role: "user", content: "new" }], system: "WRONG", stream: true });
+	const body = buildWarmupBody(captured, {
+		messages: [{ role: "user", content: "new" }],
+		system: "WRONG",
+		thinking: { type: "disabled" },
+		chat_template_kwargs: { enable_thinking: false },
+		stream: true,
+	});
 	assert.equal(body.system, "S");
 	assert.deepEqual(body.tools, [{ name: "t" }]);
 	assert.deepEqual(body.messages, [{ role: "user", content: "new" }]);
 	assert.equal(body.max_tokens, 1);
 	assert.deepEqual(body.output_config, { effort: "x" }, "thinking config must not change the prefix");
 	assert.deepEqual(body.thinking, { type: "adaptive" });
+	assert.equal(body.chat_template_kwargs, undefined, "builder's thinking kwargs must not leak in");
 });
 
 test("requestHeaders: keeps auth, drops hop headers and non-strings, extra wins", () => {

@@ -20,7 +20,19 @@ Measured on 2× RTX 3090 (vLLM, Qwen3.8-27B W4A16, TP=2), across 132 default com
 2. **Compact from cache.** On `session_before_compact` the extension re-sends that exact request (same system prompt, tools, messages, thinking settings, auth/routing headers) with one summarize instruction appended. The prefix is byte-for-byte what the server just processed, so only the instruction is prefilled; the time left is generating the summary.
 3. **Warm-up.** After compaction, it sends a 1-token request with the new context (built by Pi's own converter, with the captured system prompt, tools and thinking settings), so the summary and kept messages are already cached when you send the next turn.
 
-**Why thinking is not turned off for the summary:** chat templates such as Qwen3.x write the reasoning-effort instruction at the *start* of the system prompt when thinking is on. Turning thinking off for the summary changes the first tokens of the prompt, and the cache misses completely (seen in practice: a 245k-token session re-prefilled cold for 5 minutes). The prompt asks for brief reasoning instead.
+**The prompt is never modified, only extended.** The summary request may set `max_tokens`, `stream` and `stream_options`; every field that can reach the rendered prompt is copied verbatim and checked before sending (`assertPrefixPreserved`), so a mistake fails fast into Pi's default instead of silently costing a cold re-prefill.
+
+That matters most for thinking, because the toggle differs per model family and servers derive one field from another:
+
+| Model family | Toggle | Default |
+|---|---|---|
+| Qwen3 / Qwen3.x | `chat_template_kwargs.enable_thinking` | on |
+| DeepSeek-V3.1, IBM Granite 3.2 | `chat_template_kwargs.thinking` | off |
+| Gemma 4 | `enable_thinking` or `reasoning_effort` | off |
+| Holo2 | `thinking: false` disables | on |
+| DeepSeek R1, GLM-4.5, MiniMax-M2, ERNIE, Hunyuan, Cohere Command A | parser-specific | varies |
+
+vLLM also injects `enable_thinking` from `reasoning_effort` (`low`/`medium`/`high` → true, `none` → false). And templates like Qwen3.x render the effort text at the *start* of the system prompt, so flipping any of these re-prefills the entire conversation: an earlier build that forced thinking off turned a 245k-token compaction into a 5-minute cold read that then timed out. The summary therefore runs at the session's own thinking level, and the prompt simply asks for brief reasoning.
 
 The summary request uses `node:http` rather than `fetch`, because `fetch` gives up on a response that sends no bytes for 300 s, which a long prefill or thinking phase on a local GPU can do.
 
@@ -60,7 +72,6 @@ Optional JSON, project overrides global:
   "maxSummaryTokens": 16000,
   "minSummaryTokens": 4000,
   "promptOverheadTokens": 3000,
-  "disableThinking": false,
   "warmup": true,
   "notify": true
 }
@@ -68,7 +79,7 @@ Optional JSON, project overrides global:
 
 - `providers` / `baseUrlIncludes`: restrict to specific providers or endpoints (empty = every `anthropic-messages` model not excluded).
 - `baseUrlExcludes`: hosted Anthropic is excluded by default; it has its own caching rules.
-- `disableThinking` (default `false`): sends `thinking: {type: "disabled"}` plus `chat_template_kwargs.enable_thinking: false` for the summary. Only turn it on if your chat template changes nothing but the generation prompt when thinking flips; otherwise every compaction in a thinking-on session misses the cache.
+- There is **no option to change thinking for the summary**, by design — see below.
 - The summary budget is `min(maxSummaryTokens, contextWindow − tokensBefore − promptOverheadTokens)`; below `minSummaryTokens` Pi's default runs instead.
 
 ## What you see

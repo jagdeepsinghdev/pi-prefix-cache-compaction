@@ -15,13 +15,6 @@ export interface Config {
 	minSummaryTokens: number;
 	/** Tokens reserved for the appended instruction and chat-template overhead. */
 	promptOverheadTokens: number;
-	/**
-	 * Force thinking off for the summary request. Default false: many chat templates
-	 * (Qwen3.x among them) put the reasoning-effort text at the START of the system
-	 * prompt, so changing thinking changes the whole prefix and the cache misses.
-	 * Only enable for templates where thinking affects the generation prompt alone.
-	 */
-	disableThinking: boolean;
 	/** After compaction, send a 1-token request with the new context so the next turn starts warm. */
 	warmup: boolean;
 	notify: boolean;
@@ -35,7 +28,6 @@ export const DEFAULT_CONFIG: Config = {
 	maxSummaryTokens: 16_000,
 	minSummaryTokens: 4_000,
 	promptOverheadTokens: 3_000,
-	disableThinking: false,
 	warmup: true,
 	notify: true,
 };
@@ -72,6 +64,57 @@ export function appliesTo(model: ModelLike | undefined, cfg: Config): boolean {
 }
 
 export const SUMMARIZER_SYSTEM_MARKER = "context summarization assistant";
+
+/**
+ * Request fields that can change the rendered prompt, so the summary request must carry
+ * them EXACTLY as captured. Thinking/effort is the subtle one: the toggle differs per
+ * model family (Qwen3 `enable_thinking`, DeepSeek-V3.1 / Granite `thinking`, Gemma 4
+ * `reasoning_effort` or `enable_thinking`, Holo2 `thinking:false`), vLLM derives
+ * `enable_thinking` from `reasoning_effort` (low/medium/high -> true, none -> false),
+ * and templates like Qwen3.x render the effort text at the START of the system prompt —
+ * so flipping any of them re-prefills the whole conversation.
+ *
+ * Everything else (max_tokens, stream, sampling, metadata) never reaches the prompt.
+ */
+export const PROMPT_AFFECTING_KEYS = [
+	"system",
+	"tools",
+	"tool_choice",
+	"messages",
+	"thinking",
+	"reasoning",
+	"reasoning_effort",
+	"output_config",
+	"chat_template_kwargs",
+	"model",
+	"mm_processor_kwargs",
+	"documents",
+] as const;
+
+/** Fields the summary request is allowed to set; anything else is copied verbatim. */
+export const SUMMARY_OVERRIDES = ["max_tokens", "stream", "stream_options"] as const;
+
+export class PrefixChangedError extends Error {}
+
+/**
+ * Belt and braces: refuse to send a request whose prompt-affecting fields differ from the
+ * captured turn (other than the one appended message). A silent mismatch is not a wrong
+ * answer, it is a full cold re-prefill — minutes on a local GPU.
+ */
+export function assertPrefixPreserved(captured: Record<string, any>, body: Record<string, any>, appended: number): void {
+	for (const key of PROMPT_AFFECTING_KEYS) {
+		if (key === "messages") continue;
+		if (JSON.stringify(captured[key]) !== JSON.stringify(body[key])) {
+			throw new PrefixChangedError(`${key} differs from the captured request; that would miss the prefix cache`);
+		}
+	}
+	const cm = captured.messages ?? [];
+	const bm = body.messages ?? [];
+	if (bm.length !== cm.length + appended) throw new PrefixChangedError("message count changed beyond the appended instruction");
+	for (let i = 0; i < cm.length; i++) {
+		if (JSON.stringify(cm[i]) !== JSON.stringify(bm[i])) throw new PrefixChangedError(`message ${i} changed; that would miss the prefix cache`);
+	}
+}
 
 export function systemText(payload: Record<string, any>): string {
 	const s = payload?.system;
@@ -134,23 +177,17 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 /**
  * The captured request, unchanged up to its last message, plus one instruction.
  * Identical prefix => the server's prefix cache covers everything but the instruction.
- * Thinking fields are kept as captured unless cfg.disableThinking (see Config).
+ * The summary therefore runs at whatever thinking level the session itself uses; there is
+ * deliberately no option to change it (see PROMPT_AFFECTING_KEYS).
  */
-export function buildSummaryBody(captured: Record<string, any>, maxTokens: number, cfg: Config): Record<string, any> {
+export function buildSummaryBody(captured: Record<string, any>, maxTokens: number, _cfg?: Config): Record<string, any> {
 	const body: Record<string, any> = {
 		...captured,
 		messages: [...captured.messages, { role: "user", content: [{ type: "text", text: SUMMARY_PROMPT }] }],
 		max_tokens: maxTokens,
 		stream: true,
 	};
-	if (cfg.disableThinking) {
-		body.thinking = { type: "disabled" };
-		delete body.output_config;
-		delete body.reasoning_effort;
-		// vLLM ignores Anthropic thinking.type for Qwen-style templates; this is what it honors.
-		body.chat_template_kwargs = { ...(captured.chat_template_kwargs ?? {}), enable_thinking: false };
-		delete body.chat_template_kwargs.reasoning_effort;
-	}
+	assertPrefixPreserved(captured, body, 1);
 	return body;
 }
 
@@ -253,8 +290,11 @@ export function fileListSuffix(fileOps: { read?: Iterable<string>; edited?: Iter
  * everything else (system, tools, sampling fields) is the captured request verbatim.
  */
 export function buildWarmupBody(captured: Record<string, any>, built: Record<string, any>): Record<string, any> {
-	// Thinking fields stay as captured: in templates that render reasoning effort into the
-	// system prompt, changing them would warm a different prefix than the next real turn.
-	// A 1-token request is fine: the server stops at max_tokens, thinking or not.
-	return { ...captured, messages: built.messages, max_tokens: 1, stream: built.stream ?? true };
+	// Everything except `messages` comes from the captured turn, so the warmed prefix is the
+	// one the next real turn will send. A 1-token cap is fine: the server stops at max_tokens.
+	const body: Record<string, any> = { ...captured, messages: built.messages, max_tokens: 1, stream: built.stream ?? true };
+	for (const key of PROMPT_AFFECTING_KEYS) {
+		if (key !== "messages") body[key] = captured[key];
+	}
+	return body;
 }
