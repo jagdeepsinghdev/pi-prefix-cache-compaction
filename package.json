@@ -1,0 +1,40 @@
+{
+  "name": "pi-prefix-cache-compaction",
+  "version": "0.1.0",
+  "description": "Pi compaction that reuses the server's prefix cache (vLLM / SGLang / llama.cpp Anthropic endpoints): no cold re-prefill of the history, thinking off for the summary, and a warm-up so the next turn starts from cache.",
+  "type": "module",
+  "license": "MIT",
+  "author": "jagdeep Singh",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "compaction",
+    "prefix-cache",
+    "kv-cache",
+    "vllm",
+    "local-llm"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.85.0",
+    "@earendil-works/pi-ai": ">=0.85.0"
+  },
+  "scripts": {
+    "test": "node --test test/core.test.ts",
+    "smoke": "node scripts/rpc-smoke.mjs"
+  }
+}
