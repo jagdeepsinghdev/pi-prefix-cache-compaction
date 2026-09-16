@@ -50,6 +50,20 @@ test("isCapturable: real turns yes, Pi's fallback summarizer and empty payloads 
 		false,
 	);
 	assert.equal(isCapturable({ messages: [] }), false);
+	// Pi's summarizer sends exactly one user message wrapping the history in <conversation>
+	assert.equal(isCapturable({ system: "You are pi", messages: [{ role: "user", content: "<conversation>\nx\n</conversation>" }] }), false);
+	// but a real multi-turn chat that merely QUOTES the tag must still be captured,
+	// otherwise one such turn disables the extension for the rest of the session
+	assert.equal(
+		isCapturable({
+			system: "You are pi",
+			messages: [
+				{ role: "user", content: "what does <conversation> mean in the summarizer?" },
+				{ role: "assistant", content: "it wraps the history" },
+			],
+		}),
+		true,
+	);
 	assert.equal(isCapturable(null), false);
 });
 
@@ -237,12 +251,18 @@ test("SseCollector: tool use, truncation, empty, incomplete and error all refuse
 	assert.throws(() => err.push(sse({ type: "error", error: { message: "boom" } })), /stream error/);
 });
 
-test("toPiUsage: Anthropic fields map onto Pi's normalized usage", () => {
+test("toPiUsage: Anthropic fields map onto Pi's normalized usage, incl. totalTokens and cost", () => {
+	const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 	assert.deepEqual(
 		toPiUsage({ input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 900, cache_creation_input_tokens: 10 }),
-		{ input: 100, output: 5, cacheRead: 900, cacheWrite: 10 },
+		{ input: 100, output: 5, cacheRead: 900, cacheWrite: 10, totalTokens: 1015, cost: zeroCost },
 	);
-	assert.deepEqual(toPiUsage({}), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+	assert.deepEqual(toPiUsage({}), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: zeroCost });
+	// Pi does `totals.cost += usage.cost.total` on compaction entries (usage-totals.js);
+	// a missing cost object throws there, so both fields must always be present.
+	const u = toPiUsage({ output_tokens: 3 });
+	assert.equal(typeof u.cost.total, "number");
+	assert.equal(typeof u.totalTokens, "number");
 });
 
 test("fileListSuffix: read-only vs modified, sorted, empty when none", () => {

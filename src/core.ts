@@ -149,15 +149,17 @@ function hasConversationTag(content: unknown): boolean {
 /**
  * A payload worth capturing: a real conversation turn, not Pi's own fallback summarizer.
  * Two filters: the summarizer system prompt wording, and the `<conversation>` tag its
- * requests always carry. A genuine user message containing the literal tag merely skips
- * one capture (the previous turn stays the anchor); it can never capture a summarizer.
+ * requests carry. The tag is only checked on a SINGLE-message payload, which is what Pi's
+ * summarizer sends (buildSummarizationContext: one user message). Scanning every message
+ * would disable capture for a whole session as soon as any turn quotes the literal tag —
+ * and a session that discusses this extension does exactly that.
  */
 export function isCapturable(payload: unknown): payload is Record<string, any> {
 	if (!payload || typeof payload !== "object") return false;
 	const p = payload as Record<string, any>;
 	if (!Array.isArray(p.messages) || p.messages.length === 0) return false;
 	if (systemText(p).includes(SUMMARIZER_SYSTEM_MARKER)) return false;
-	return !p.messages.some((m) => hasConversationTag(m?.content));
+	return !(p.messages.length === 1 && hasConversationTag(p.messages[0]?.content));
 }
 
 export function summaryTokenBudget(contextWindow: number, tokensBefore: number, cfg: Config): number | undefined {
@@ -244,7 +246,11 @@ export interface SseResult {
 	usage: Record<string, number>;
 }
 
-/** Structurally identical to pi-ai's Usage, kept local so core.ts has no Pi imports. */
+/**
+ * Structurally identical to pi-ai's Usage, kept local so core.ts has no Pi imports.
+ * `totalTokens` and `cost` are REQUIRED there: Pi feeds compaction usage into
+ * `addUsageToTotals`, which reads `usage.cost.total` — omit it and session stats throw.
+ */
 export interface UsageLike {
 	input: number;
 	output: number;
@@ -252,15 +258,24 @@ export interface UsageLike {
 	cacheWrite: number;
 	cacheWrite1h?: number;
 	reasoning?: number;
+	totalTokens: number;
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
 }
 
 /** Anthropic usage fields → Pi's normalized Usage, for CompactionResult.usage. */
 export function toPiUsage(u: Record<string, number>): UsageLike {
+	const input = u.input_tokens ?? 0;
+	const output = u.output_tokens ?? 0;
+	const cacheRead = u.cache_read_input_tokens ?? 0;
+	const cacheWrite = u.cache_creation_input_tokens ?? 0;
 	return {
-		input: u.input_tokens ?? 0,
-		output: u.output_tokens ?? 0,
-		cacheRead: u.cache_read_input_tokens ?? 0,
-		cacheWrite: u.cache_creation_input_tokens ?? 0,
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		totalTokens: input + output + cacheRead + cacheWrite,
+		// Self-hosted endpoints bill nothing; Pi still requires the shape.
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 }
 
