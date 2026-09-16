@@ -287,6 +287,8 @@ export class SseCollector {
 	text = "";
 	thinkingChars = 0;
 	stopReason = "";
+	/** Saw the terminal `message_stop` event: the server finished, whatever it reported. */
+	complete = false;
 	usage: Record<string, number> = {};
 
 	push(chunk: string): void {
@@ -303,9 +305,11 @@ export class SseCollector {
 		this.buf = "";
 		if (this.stopReason === "max_tokens") throw new SummaryError("summary hit the token cap");
 		if (!this.text.trim()) throw new SummaryError("empty summary");
-		// A stream that carried text but never a stop reason was cut off mid-summary
-		// (server closed the socket); accept it and you keep a truncated checkpoint.
-		if (!this.stopReason) throw new SummaryError("stream ended without a stop reason");
+		// Reject only a stream that was cut off mid-summary: no stop reason AND no terminal
+		// `message_stop`. Accepting one would store a truncated checkpoint. A server that
+		// ends cleanly without reporting a stop reason is fine — requiring the field would
+		// make every compaction fall back on such a server.
+		if (!this.stopReason && !this.complete) throw new SummaryError("stream ended mid-summary (no stop reason, no message_stop)");
 		return { text: this.text.trim(), stopReason: this.stopReason, usage: this.usage };
 	}
 
@@ -334,6 +338,9 @@ export class SseCollector {
 				case "message_delta":
 					this.stopReason = ev.delta?.stop_reason ?? this.stopReason;
 					Object.assign(this.usage, ev.usage ?? {});
+					break;
+				case "message_stop":
+					this.complete = true;
 					break;
 				case "error":
 					throw new SummaryError(`stream error: ${JSON.stringify(ev.error).slice(0, 200)}`);

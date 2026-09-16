@@ -232,6 +232,14 @@ test("SseCollector: CRLF frames parse", () => {
 	assert.equal(c.finish().text, "ok");
 });
 
+test("SseCollector: a clean end without stop_reason is accepted", () => {
+	// some servers finish with message_stop but never report stop_reason; requiring the
+	// field would make every compaction fall back to Pi's default on such a server
+	const c = new SseCollector();
+	c.push(sse({ type: "content_block_delta", delta: { type: "text_delta", text: "## Goal" } }, { type: "message_stop" }));
+	assert.equal(c.finish().text, "## Goal");
+});
+
 test("SseCollector: tool use, truncation, empty, incomplete and error all refuse", () => {
 	const toolUse = new SseCollector();
 	assert.throws(() => toolUse.push(sse({ type: "content_block_start", content_block: { type: "tool_use" } })), SummaryError);
@@ -242,10 +250,11 @@ test("SseCollector: tool use, truncation, empty, incomplete and error all refuse
 
 	assert.throws(() => new SseCollector().finish(), /empty/);
 
-	// text arrived but the server closed the connection before message_delta: a truncated summary
+	// text arrived but the server closed the connection before message_delta AND without
+	// the terminal message_stop: a truncated summary
 	const cut = new SseCollector();
 	cut.push(sse({ type: "content_block_delta", delta: { type: "text_delta", text: "## Goal\npartial" } }));
-	assert.throws(() => cut.finish(), /stop reason/);
+	assert.throws(() => cut.finish(), /mid-summary/);
 
 	const err = new SseCollector();
 	assert.throws(() => err.push(sse({ type: "error", error: { message: "boom" } })), /stream error/);
