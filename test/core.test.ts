@@ -9,6 +9,7 @@ import {
 	isCapturable,
 	mergeConfig,
 	messagesUrl,
+	modelKey,
 	requestHeaders,
 	assertPrefixPreserved,
 	PrefixChangedError,
@@ -16,6 +17,7 @@ import {
 	SummaryError,
 	SUMMARY_PROMPT,
 	summaryTokenBudget,
+	toPiUsage,
 } from "../src/core.ts";
 
 const local = { provider: "qwen-local", api: "anthropic-messages", baseUrl: "http://127.0.0.1:18770", contextWindow: 262_144 };
@@ -49,6 +51,31 @@ test("isCapturable: real turns yes, Pi's fallback summarizer and empty payloads 
 	);
 	assert.equal(isCapturable({ messages: [] }), false);
 	assert.equal(isCapturable(null), false);
+});
+
+test("isCapturable: <conversation>-tagged requests are filtered even with an unknown system prompt", () => {
+	const sys = "Some totally different system prompt";
+	assert.equal(
+		isCapturable({ system: sys, messages: [{ role: "user", content: "<conversation>\n[User]: hi\n</conversation>\n\nSummarize." }] }),
+		false,
+	);
+	assert.equal(
+		isCapturable({ system: sys, messages: [{ role: "user", content: [{ type: "text", text: "<conversation>\nx\n</conversation>" }] }] }),
+		false,
+	);
+	// a normal message that merely mentions the word stays capturable
+	assert.equal(isCapturable({ system: sys, messages: [{ role: "user", content: "write a conversation serializer" }] }), true);
+	// …while one containing the literal tag skips this one capture (previous turn stays the anchor)
+	assert.equal(isCapturable({ system: sys, messages: [{ role: "user", content: "write a <conversation> serializer" }] }), false);
+});
+
+test("modelKey: stable per model identity, distinct per provider/baseUrl/id", () => {
+	const a = { provider: "qwen-local", id: "qwen3.8-27b", baseUrl: "http://127.0.0.1:18770" };
+	assert.equal(modelKey(a), modelKey({ ...a }));
+	assert.notEqual(modelKey(a), modelKey({ ...a, id: "other" }));
+	assert.notEqual(modelKey(a), modelKey({ ...a, provider: "other-local" }));
+	assert.notEqual(modelKey(a), modelKey({ ...a, baseUrl: "http://127.0.0.1:9999" }));
+	assert.equal(modelKey(undefined), undefined);
 });
 
 test("summaryTokenBudget: capped, and refuses when the window is nearly full", () => {
@@ -174,18 +201,24 @@ test("SseCollector: text across arbitrary chunk splits, usage merged", () => {
 
 test("SseCollector: thinking deltas are progress, not summary text", () => {
 	const c = new SseCollector();
-	c.push(sse({ type: "content_block_delta", delta: { type: "thinking_delta", thinking: "hmm" } }, { type: "content_block_delta", delta: { type: "text_delta", text: "## Goal" } }));
+	c.push(
+		sse(
+			{ type: "content_block_delta", delta: { type: "thinking_delta", thinking: "hmm" } },
+			{ type: "content_block_delta", delta: { type: "text_delta", text: "## Goal" } },
+			{ type: "message_delta", delta: { stop_reason: "end_turn" } },
+		),
+	);
 	assert.equal(c.thinkingChars, 3);
 	assert.equal(c.finish().text, "## Goal");
 });
 
 test("SseCollector: CRLF frames parse", () => {
 	const c = new SseCollector();
-	c.push(sse({ type: "content_block_delta", delta: { type: "text_delta", text: "ok" } }).replace(/\n/g, "\r\n"));
+	c.push(sse({ type: "content_block_delta", delta: { type: "text_delta", text: "ok" } }, { type: "message_delta", delta: { stop_reason: "end_turn" } }).replace(/\n/g, "\r\n"));
 	assert.equal(c.finish().text, "ok");
 });
 
-test("SseCollector: tool use, truncation, empty and error all refuse", () => {
+test("SseCollector: tool use, truncation, empty, incomplete and error all refuse", () => {
 	const toolUse = new SseCollector();
 	assert.throws(() => toolUse.push(sse({ type: "content_block_start", content_block: { type: "tool_use" } })), SummaryError);
 
@@ -195,8 +228,21 @@ test("SseCollector: tool use, truncation, empty and error all refuse", () => {
 
 	assert.throws(() => new SseCollector().finish(), /empty/);
 
+	// text arrived but the server closed the connection before message_delta: a truncated summary
+	const cut = new SseCollector();
+	cut.push(sse({ type: "content_block_delta", delta: { type: "text_delta", text: "## Goal\npartial" } }));
+	assert.throws(() => cut.finish(), /stop reason/);
+
 	const err = new SseCollector();
 	assert.throws(() => err.push(sse({ type: "error", error: { message: "boom" } })), /stream error/);
+});
+
+test("toPiUsage: Anthropic fields map onto Pi's normalized usage", () => {
+	assert.deepEqual(
+		toPiUsage({ input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 900, cache_creation_input_tokens: 10 }),
+		{ input: 100, output: 5, cacheRead: 900, cacheWrite: 10 },
+	);
+	assert.deepEqual(toPiUsage({}), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 });
 
 test("fileListSuffix: read-only vs modified, sorted, empty when none", () => {

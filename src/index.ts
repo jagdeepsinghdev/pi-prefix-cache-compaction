@@ -35,34 +35,47 @@ import {
 	isCapturable,
 	mergeConfig,
 	messagesUrl,
+	modelKey,
 	requestHeaders,
 	SseCollector,
 	summaryTokenBudget,
+	toPiUsage,
 } from "./core.ts";
 
 const CONFIG_NAME = "pi-prefix-cache-compaction.json";
 
-function readJson(path: string): Partial<Config> | undefined {
+function readJsonFile(path: string, problems: string[]): Partial<Config> | undefined {
+	if (!existsSync(path)) return undefined;
 	try {
-		return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : undefined;
-	} catch {
+		return JSON.parse(readFileSync(path, "utf8"));
+	} catch (err) {
+		problems.push(`${path}: ${(err as Error).message}`);
 		return undefined;
 	}
 }
 
-function loadConfig(cwd: string): Config {
+function loadConfig(cwd: string): { config: Config; problems: string[] } {
+	const problems: string[] = [];
 	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-	return mergeConfig(readJson(join(agentDir, CONFIG_NAME)), readJson(join(cwd, ".pi", CONFIG_NAME)));
+	const config = mergeConfig(readJsonFile(join(agentDir, CONFIG_NAME), problems), readJsonFile(join(cwd, ".pi", CONFIG_NAME), problems));
+	return { config, problems };
 }
 
-type Capture = { payload?: Record<string, any>; headers?: Record<string, unknown> };
+type Capture = {
+	payload?: Record<string, any>;
+	headers?: Record<string, unknown>;
+	/** modelKey() of the model the payload was captured for (undefined = legacy capture). */
+	modelKey?: string;
+	/** True after a Pi-default compaction invalidated the prefix; a new real turn clears it. */
+	stale?: boolean;
+};
 
 const stats = { compactions: 0, fallbacks: 0, warmups: 0, lastSeconds: 0, lastReason: "" };
 
 export default function prefixCacheCompaction(pi: ExtensionAPI) {
 	const captures = new Map<string, Capture>(); // Pi session id -> last real request
 	let config: Config | undefined;
-	const cfg = (ctx: ExtensionContext) => (config ??= loadConfig(ctx.cwd));
+	const cfg = (ctx: ExtensionContext) => (config ??= loadConfig(ctx.cwd).config);
 	const notify = (ctx: ExtensionContext, msg: string, kind: "info" | "warning" = "info") => {
 		if (cfg(ctx).notify) ctx.ui.notify(msg, kind);
 	};
@@ -73,14 +86,21 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		config = loadConfig(ctx.cwd);
+		const { config: c, problems } = loadConfig(ctx.cwd);
+		config = c;
+		if (problems.length && c.notify) ctx.ui.notify(`pi-prefix-cache-compaction: ignoring malformed config (${problems.join("; ")})`, "warning");
+	});
+
+	// Release the (potentially megabyte-scale) captured payload when a session goes away.
+	pi.on("session_shutdown", (_event, ctx) => {
+		captures.delete(ctx.sessionManager.getSessionId());
 	});
 
 	pi.on("before_provider_headers", (event, ctx) => {
 		if (!appliesTo(ctx.model, cfg(ctx))) return;
 		const id = ctx.sessionManager.getSessionId();
 		const cap = captures.get(id) ?? {};
-		cap.headers = event.headers as Record<string, unknown>; // copied at use time
+		cap.headers = { ...event.headers }; // copy: later extensions may mutate event.headers in place
 		captures.set(id, cap);
 	});
 
@@ -89,6 +109,8 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 		const id = ctx.sessionManager.getSessionId();
 		const cap = captures.get(id) ?? {};
 		cap.payload = structuredClone(event.payload as Record<string, any>);
+		cap.modelKey = modelKey(ctx.model);
+		cap.stale = false; // this real turn re-anchors the prefix
 		captures.set(id, cap);
 	});
 
@@ -99,6 +121,8 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 		const id = ctx.sessionManager.getSessionId();
 		const cap = captures.get(id);
 		if (!cap?.payload) return fallback(ctx, "no captured request yet in this process");
+		if (cap.modelKey !== modelKey(ctx.model)) return fallback(ctx, "last captured request was from a different model");
+		if (cap.stale) return fallback(ctx, "capture is stale after an earlier default compaction");
 
 		const { preparation, signal } = event;
 		const budget = summaryTokenBudget(ctx.model?.contextWindow ?? 0, preparation.tokensBefore, c);
@@ -110,7 +134,7 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 			const { text, usage } = await streamMessages(
 				messagesUrl(ctx.model?.baseUrl),
 				requestHeaders(cap.headers, { "x-session-id": id }),
-				JSON.stringify(buildSummaryBody(cap.payload, budget, c)),
+				JSON.stringify(buildSummaryBody(cap.payload, budget)),
 				signal,
 			);
 			const secs = Math.round((Date.now() - t0) / 1000);
@@ -122,6 +146,7 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 					summary: text + fileListSuffix(preparation.fileOps),
 					firstKeptEntryId: preparation.firstKeptEntryId,
 					tokensBefore: preparation.tokensBefore,
+					usage: toPiUsage(usage),
 				},
 			};
 		} catch (err) {
@@ -133,10 +158,15 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 	// Warm the new prefix (summary + kept messages) so the next turn is not a cold prefill.
 	pi.on("session_compact", async (event, ctx) => {
 		const c = cfg(ctx);
-		if (!c.warmup || !appliesTo(ctx.model, c) || event.willRetry) return;
 		const id = ctx.sessionManager.getSessionId();
 		const cap = captures.get(id);
+		// A Pi-default compaction means the captured prefix no longer describes the session.
+		// Keep it only to feed the warm-up below; never for a summary again until a real turn
+		// re-anchors it (before_provider_request clears `stale`).
+		if (cap && !event.fromExtension) cap.stale = true;
+		if (!c.warmup || !appliesTo(ctx.model, c) || event.willRetry) return;
 		if (!cap?.payload || !ctx.model) return;
+		if (cap.modelKey !== modelKey(ctx.model)) return; // warmed prefix would not match the new model
 		try {
 			const session = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
 			const messages = convertToLlm(session.messages);
@@ -162,12 +192,14 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 	pi.registerCommand("prefix-compaction", {
 		description: "pi-prefix-cache-compaction: status and config",
 		handler: async (_args, ctx) => {
-			const c = cfg(ctx);
+			const { config: c, problems } = loadConfig(ctx.cwd); // fresh read so edits are visible
+			config = c;
 			ctx.ui.notify(
 				[
 					`applies to current model: ${appliesTo(ctx.model, c)}`,
 					`cached compactions: ${stats.compactions} (last ${stats.lastSeconds}s), fallbacks: ${stats.fallbacks}${stats.lastReason ? ` (last: ${stats.lastReason})` : ""}, warm-ups: ${stats.warmups}`,
 					`config: ${JSON.stringify(c)}`,
+					...problems.map((p) => `config problem: ${p}`),
 				].join("\n"),
 				"info",
 			);
@@ -211,10 +243,13 @@ function streamMessages(url: string, headers: Record<string, string>, body: stri
 		});
 		req.setTimeout(0);
 		const onAbort = () => req.destroy(new Error("aborted"));
-		if (signal.aborted) return onAbort();
-		signal.addEventListener("abort", onAbort, { once: true });
+		// The error listener must exist before the pre-abort check: req.destroy(err) emits
+		// 'error' asynchronously, and with no listener that is an uncaught exception that
+		// kills the process instead of rejecting this promise (graceful cancel).
 		req.on("error", reject);
+		signal.addEventListener("abort", onAbort, { once: true });
 		req.on("close", () => signal.removeEventListener("abort", onAbort));
+		if (signal.aborted) return onAbort();
 		req.end(body);
 	});
 }

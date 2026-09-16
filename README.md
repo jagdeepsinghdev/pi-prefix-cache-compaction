@@ -36,7 +36,7 @@ vLLM also injects `enable_thinking` from `reasoning_effort` (`low`/`medium`/`hig
 
 The summary request uses `node:http` rather than `fetch`, because `fetch` gives up on a response that sends no bytes for 300 s, which a long prefill or thinking phase on a local GPU can do.
 
-Anything unexpected makes it step aside and Pi's default compaction runs: overflow recovery, no captured request yet (e.g. right after `/reload`), too little room left in the window, the model trying to call a tool, a truncated summary, or any HTTP/stream error.
+Anything unexpected makes it step aside and Pi's default compaction runs: overflow recovery, no captured request yet (e.g. right after `/reload`), a capture that belongs to a different model or to a pre-fallback-compaction history, too little room left in the window, the model trying to call a tool, a summary cut off mid-stream, or any HTTP/stream error.
 
 Technique credit: [pisceslailai/deepseek-kvcache](https://github.com/pisceslailai/deepseek-kvcache) (DeepSeek, OpenAI wire format). This package applies it to the Anthropic Messages API used by Pi custom providers.
 
@@ -94,8 +94,11 @@ Context re-warmed in Ns; next turn starts from cache
 
 - Anthropic Messages wire format only (not `openai-completions` yet).
 - The capture lives in memory: the first compaction after starting or `/reload`, before any turn is sent, uses Pi's default.
+- Switching the model mid-session invalidates the capture (different model means a different cache): the next compaction uses Pi's default until the new model sends a real turn.
+- After falling back to Pi's default compaction, the capture is marked stale until a real turn re-anchors it, so two consecutive compactions without a turn in between use the default both times. The warm-up still runs after such a default compaction.
 - The summary covers the whole captured request, including the recent messages Pi keeps verbatim, so it can repeat a little of that tail.
 - The warm-up uses Pi's `convertToLlm`, not other extensions' `context` transforms; if you use such extensions the warm-up may only partly hit.
+- A user message containing the literal `<conversation>` tag is not captured (same text as Pi's own summarizer requests); the previous turn stays the anchor instead.
 
 ## Development
 

@@ -47,9 +47,20 @@ export function mergeConfig(...layers: Array<Partial<Config> | undefined>): Conf
 
 export interface ModelLike {
 	provider?: string;
+	id?: string;
 	api?: string;
 	baseUrl?: string;
 	contextWindow?: number;
+}
+
+/**
+ * Stable fingerprint of the model a request was captured for. A capture is only reusable
+ * for the same model: different model = different prefix cache, and the captured `model`
+ * field is copied verbatim, so the server would silently serve the old model.
+ */
+export function modelKey(m: ModelLike | undefined): string | undefined {
+	if (!m) return undefined;
+	return `${m.provider ?? ""}|${m.baseUrl ?? ""}|${m.id ?? ""}`;
 }
 
 /** Only the Anthropic Messages wire format is supported (that is what the payload surgery assumes). */
@@ -123,12 +134,30 @@ export function systemText(payload: Record<string, any>): string {
 	return "";
 }
 
-/** A payload worth capturing: a real conversation turn, not Pi's own fallback summarizer. */
+/**
+ * Pi's fallback summarizer wraps the serialized history in these tags
+ * (compaction.js: `<conversation>...`), independent of its system prompt wording.
+ */
+export const CONVERSATION_TAG = "<conversation>";
+
+function hasConversationTag(content: unknown): boolean {
+	if (typeof content === "string") return content.includes(CONVERSATION_TAG);
+	if (Array.isArray(content)) return content.some((b) => typeof b?.text === "string" && b.text.includes(CONVERSATION_TAG));
+	return false;
+}
+
+/**
+ * A payload worth capturing: a real conversation turn, not Pi's own fallback summarizer.
+ * Two filters: the summarizer system prompt wording, and the `<conversation>` tag its
+ * requests always carry. A genuine user message containing the literal tag merely skips
+ * one capture (the previous turn stays the anchor); it can never capture a summarizer.
+ */
 export function isCapturable(payload: unknown): payload is Record<string, any> {
 	if (!payload || typeof payload !== "object") return false;
 	const p = payload as Record<string, any>;
 	if (!Array.isArray(p.messages) || p.messages.length === 0) return false;
-	return !systemText(p).includes(SUMMARIZER_SYSTEM_MARKER);
+	if (systemText(p).includes(SUMMARIZER_SYSTEM_MARKER)) return false;
+	return !p.messages.some((m) => hasConversationTag(m?.content));
 }
 
 export function summaryTokenBudget(contextWindow: number, tokensBefore: number, cfg: Config): number | undefined {
@@ -180,7 +209,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
  * The summary therefore runs at whatever thinking level the session itself uses; there is
  * deliberately no option to change it (see PROMPT_AFFECTING_KEYS).
  */
-export function buildSummaryBody(captured: Record<string, any>, maxTokens: number, _cfg?: Config): Record<string, any> {
+export function buildSummaryBody(captured: Record<string, any>, maxTokens: number): Record<string, any> {
 	const body: Record<string, any> = {
 		...captured,
 		messages: [...captured.messages, { role: "user", content: [{ type: "text", text: SUMMARY_PROMPT }] }],
@@ -215,6 +244,26 @@ export interface SseResult {
 	usage: Record<string, number>;
 }
 
+/** Structurally identical to pi-ai's Usage, kept local so core.ts has no Pi imports. */
+export interface UsageLike {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cacheWrite1h?: number;
+	reasoning?: number;
+}
+
+/** Anthropic usage fields → Pi's normalized Usage, for CompactionResult.usage. */
+export function toPiUsage(u: Record<string, number>): UsageLike {
+	return {
+		input: u.input_tokens ?? 0,
+		output: u.output_tokens ?? 0,
+		cacheRead: u.cache_read_input_tokens ?? 0,
+		cacheWrite: u.cache_creation_input_tokens ?? 0,
+	};
+}
+
 export class SummaryError extends Error {}
 
 /** Incremental Anthropic SSE parser. Throws SummaryError on tool use or stream error. */
@@ -239,6 +288,9 @@ export class SseCollector {
 		this.buf = "";
 		if (this.stopReason === "max_tokens") throw new SummaryError("summary hit the token cap");
 		if (!this.text.trim()) throw new SummaryError("empty summary");
+		// A stream that carried text but never a stop reason was cut off mid-summary
+		// (server closed the socket); accept it and you keep a truncated checkpoint.
+		if (!this.stopReason) throw new SummaryError("stream ended without a stop reason");
 		return { text: this.text.trim(), stopReason: this.stopReason, usage: this.usage };
 	}
 
