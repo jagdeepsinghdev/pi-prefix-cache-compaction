@@ -9,7 +9,9 @@
 - Captures are tied to the model (provider/baseUrl/id fingerprint): switching models mid-session falls back to Pi's default until the new model sends a real turn.
 - After falling back to Pi's default compaction the capture is marked stale and is never used for a summary again until a real turn re-anchors it. The post-compaction warm-up still runs and warms the new prefix in that case.
 - Captures are released on session shutdown, and captured headers are shallow-copied so later extensions' in-place header mutations cannot change them.
-- A summary stream that ends without a stop reason (server closed the connection mid-summary) now falls back to Pi's default instead of keeping a truncated checkpoint.
+- A summary stream cut mid-flight (no stop reason **and** no terminal `message_stop`) falls back to Pi's default instead of keeping a truncated checkpoint. A server that ends cleanly without reporting a stop reason is accepted.
+- `toPiUsage` emits `totalTokens` and a zero `cost` object: Pi feeds compaction usage into `addUsageToTotals`, which reads `usage.cost.total`, so omitting it threw in Pi's session-stats path.
+- The `<conversation>` summarizer filter applies only to single-message payloads (what Pi's summarizer sends), so a real chat that merely quotes the tag no longer disables capture for the rest of the session.
 - The compaction result now carries the summary request's usage, so it counts toward session totals.
 - `isCapturable` also filters requests whose messages wrap the history in `<conversation>` tags, so Pi's fallback summarizer is recognized even if its system prompt wording ever changes.
 - `/prefix-compaction` re-reads the config files, and unparseable config files produce a warning instead of being silently ignored.
