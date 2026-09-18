@@ -16,12 +16,24 @@
   "keywords": [
     "pi-package",
     "pi",
+    "pi-extension",
+    "pi-coding-agent",
     "coding-agent",
+    "extension",
     "compaction",
+    "context-compaction",
+    "auto-compact",
     "prefix-cache",
+    "prompt-cache",
     "kv-cache",
+    "kv-cache-reuse",
+    "anthropic-messages",
     "vllm",
-    "local-llm"
+    "sglang",
+    "llama.cpp",
+    "qwen",
+    "local-llm",
+    "self-hosted"
   ],
   "engines": {
     "node": ">=22.19.0"
