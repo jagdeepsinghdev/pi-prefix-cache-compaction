@@ -5,6 +5,14 @@
   "type": "module",
   "license": "MIT",
   "author": "jagdeep Singh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jagdeepsinghdev/pi-prefix-cache-compaction.git"
+  },
+  "homepage": "https://github.com/jagdeepsinghdev/pi-prefix-cache-compaction#readme",
+  "bugs": {
+    "url": "https://github.com/jagdeepsinghdev/pi-prefix-cache-compaction/issues"
+  },
   "keywords": [
     "pi-package",
     "pi",
