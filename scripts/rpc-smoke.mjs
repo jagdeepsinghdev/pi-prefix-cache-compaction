@@ -68,6 +68,7 @@ pi.stdout.on("data", (d) => {
 			continue;
 		}
 		seen.push(ev);
+		if (process.env.SMOKE_DEBUG) console.error(el(), "event:", ev.type, ev.id ?? "", ev.error ?? "", ev.type === "agent_end" ? `messages=${ev.messages?.length ?? "?"}` : "");
 		if (ev.type === "extension_ui_request" && ev.method === "notify") console.log(el(), "notify:", ev.message);
 		if (ev.type === "extension_error") console.log(el(), "EXTENSION ERROR:", JSON.stringify(ev).slice(0, 300));
 		waiters = waiters.filter((w) => !w(ev));
