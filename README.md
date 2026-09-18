@@ -20,7 +20,7 @@ Measured on 2× RTX 3090 (vLLM, Qwen3.8-27B W4A16, TP=2), across 132 default com
 2. **Compact from cache.** On `session_before_compact` the extension re-sends that exact request (same system prompt, tools, messages, thinking settings, auth/routing headers) with one summarize instruction appended. The prefix is byte-for-byte what the server just processed, so only the instruction is prefilled; the time left is generating the summary.
 3. **Warm-up.** After compaction, it sends a 1-token request with the new context (built by Pi's own converter, with the captured system prompt, tools and thinking settings), so the summary and kept messages are already cached when you send the next turn.
 
-**The prompt is never modified, only extended.** The summary request may set `max_tokens`, `stream` and `stream_options`; every field that can reach the rendered prompt is copied verbatim and checked before sending (`assertPrefixPreserved`), so a mistake fails fast into Pi's default instead of silently costing a cold re-prefill.
+**The prompt is never modified, only extended.** The summary request may set `max_tokens` and `stream`; every field that can reach the rendered prompt is copied verbatim and checked before sending (`assertPrefixPreserved`), so a mistake fails fast into Pi's default instead of silently costing a cold re-prefill.
 
 That matters most for thinking, because the toggle differs per model family and servers derive one field from another:
 
@@ -38,11 +38,18 @@ The summary request uses `node:http` rather than `fetch`, because `fetch` gives 
 
 Anything unexpected makes it step aside and Pi's default compaction runs: overflow recovery, no captured request yet (e.g. right after `/reload`), a capture that belongs to a different model or to a pre-fallback-compaction history, too little room left in the window, the model trying to call a tool, a summary cut off mid-stream, or any HTTP/stream error.
 
-Technique credit: [pisceslailai/deepseek-kvcache](https://github.com/pisceslailai/deepseek-kvcache) (DeepSeek, OpenAI wire format). This package applies it to the Anthropic Messages API used by Pi custom providers.
+## Related work
+
+The same idea, appending the summarize instruction to the last real request so the prefix stays cached, exists for other wire formats:
+
+- [pisceslailai/deepseek-kvcache](https://github.com/pisceslailai/deepseek-kvcache): DeepSeek's hosted API (OpenAI wire format). Technique credit for this package.
+- [yuan-/pi-kvc](https://github.com/yuan-/pi-kvc): llama.cpp / LM Studio over `openai-completions`, with a manual `/kvc` command.
+
+Neither is on npm and neither covers `anthropic-messages`, which is what Pi custom providers for vLLM, SGLang and llama.cpp typically use. This package adds the Anthropic Messages payload handling, the model-bound and stale-capture checks, the prefix-preservation assertion and the post-compaction warm-up.
 
 ## Requirements
 
-- Pi coding-agent ≥ 0.85, Node ≥ 22.19.
+- Pi coding-agent ≥ 0.85 (tested on 0.85.1), Node ≥ 22.19.
 - A custom provider with `"api": "anthropic-messages"` pointing at a server with automatic prefix caching (vLLM `--enable-prefix-caching`, SGLang RadixAttention, llama.cpp `--cache-reuse`).
 - A chat template that renders earlier turns the same whether or not a new user message follows. Templates that strip earlier reasoning after a new user message (for example Qwen3 with `preserve_thinking` off) still work, with a smaller cache hit.
 
@@ -99,6 +106,7 @@ Context re-warmed in Ns; next turn starts from cache
 - The summary covers the whole captured request, including the recent messages Pi keeps verbatim, so it can repeat a little of that tail.
 - The warm-up uses Pi's `convertToLlm`, not other extensions' `context` transforms; if you use such extensions the warm-up may only partly hit.
 - A user message containing the literal `<conversation>` tag is not captured (same text as Pi's own summarizer requests); the previous turn stays the anchor instead.
+- The warm-up imports `completeSimple` from `@earendil-works/pi-ai/compat`, the same entrypoint Pi 0.85 uses for its own compaction. Pi documents it as a transitional API, so a future Pi may need a small update here; the summary path itself uses plain `node:http` and is unaffected.
 
 ## Development
 

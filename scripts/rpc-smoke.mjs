@@ -26,7 +26,7 @@ const model = opt("model");
 const warmup = !args.includes("--no-warmup");
 const thinking = opt("thinking", "off");
 if (!provider || !model) {
-	console.error("usage: rpc-smoke.mjs --provider <id> --model <id> [--no-warmup] [--extra-extension <path>]");
+	console.error("usage: rpc-smoke.mjs --provider <id> --model <id> [--thinking <level>] [--no-warmup] [--extra-extension <path>]");
 	process.exit(2);
 }
 

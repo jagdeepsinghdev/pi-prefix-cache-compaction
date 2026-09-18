@@ -103,7 +103,7 @@ export const PROMPT_AFFECTING_KEYS = [
 ] as const;
 
 /** Fields the summary request is allowed to set; anything else is copied verbatim. */
-export const SUMMARY_OVERRIDES = ["max_tokens", "stream", "stream_options"] as const;
+export const SUMMARY_OVERRIDES = ["max_tokens", "stream"] as const;
 
 export class PrefixChangedError extends Error {}
 
