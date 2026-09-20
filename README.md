@@ -53,7 +53,9 @@ Each row is a full run of `scripts/rpc-smoke.mjs` (real turns, compaction throug
 | DeepSeek API (`/anthropic`) | `anthropic-messages` | 0.85.1, 0.86.0 | off, high | 56,192 / 56,216 |
 | DeepSeek API (`/v1`) | `openai-completions` | 0.85.1, 0.86.0 | off, high | 56,192 / 56,313 |
 
-Not verified: SGLang (untested here; its OpenAI-compatible endpoint should behave like vLLM's), `openai-responses` (unsupported), and long multi-compaction sessions on the OpenAI path, which has hours rather than weeks of use behind it.
+Multi-compaction sessions: `--cycles 4` on DeepSeek, both wire formats, thinking high. All eight compactions went through the extension with a full cache hit (44,672 to 68,864 prompt tokens served from cache per request), and two planted facts survived every summary-of-a-summary.
+
+Not verified: SGLang (needs an NVIDIA GPU; not run here). Not implemented: `openai-responses`, a different payload and stream format, which is what Pi's built-in hosted OpenAI provider uses.
 
 ## Related work
 
@@ -131,10 +133,10 @@ The cache count comes from the server's usage report: DeepSeek and llama.cpp inc
 
 ```bash
 npm test                     # unit tests (node --test, no Pi needed)
-node scripts/rpc-smoke.mjs --provider <id> --model <id> [--thinking xhigh] [--no-warmup] [--rows 700]
+node scripts/rpc-smoke.mjs --provider <id> --model <id> [--thinking xhigh] [--no-warmup] [--rows 700] [--cycles 1]
 ```
 
-The smoke test runs Pi in RPC mode in an isolated agent directory against your real server, compacts a ~45k-token session (`--rows` scales it; 300 is comfortable for a laptop llama.cpp) and times the first turn after. `PI_BIN` selects another Pi binary, `PI_CODING_AGENT_DIR` another `models.json`.
+The smoke test runs Pi in RPC mode in an isolated agent directory against your real server, compacts a ~45k-token session (`--rows` scales it; 300 is comfortable for a laptop llama.cpp) and times the first turn after; `--cycles N` repeats compact-then-continue N times in one session and checks two planted facts after each. `PI_BIN` selects another Pi binary, `PI_CODING_AGENT_DIR` another `models.json`.
 
 ## License
 

@@ -6,7 +6,11 @@
  * Isolated: uses a temporary PI_CODING_AGENT_DIR containing only your models.json (and
  * auth.json if present) plus this extension, so other installed extensions do not interfere.
  *
- *   node scripts/rpc-smoke.mjs --provider qwen-local --model qwen3.8-27b [--thinking xhigh] [--no-warmup] [--rows 700]
+ *   node scripts/rpc-smoke.mjs --provider qwen-local --model qwen3.8-27b [--thinking xhigh] [--no-warmup] [--rows 700] [--cycles 1]
+ *
+ * --cycles N compacts N times in one session, re-reading the fixture files between
+ * compactions so each cycle summarizes a summary-plus-new-history context. Exit code 0 only
+ * if every compaction went through this extension and the facts survived every cycle.
  *
  * --rows sets the size of each of the three fixture files (700 rows ≈ 15k tokens each, so
  * ~45k tokens of context before compaction); lower it for slow local servers.
@@ -29,8 +33,9 @@ const model = opt("model");
 const warmup = !args.includes("--no-warmup");
 const thinking = opt("thinking", "off");
 const rows = Number(opt("rows", "700"));
+const cycles = Number(opt("cycles", "1"));
 if (!provider || !model) {
-	console.error("usage: rpc-smoke.mjs --provider <id> --model <id> [--thinking <level>] [--no-warmup] [--rows <n>] [--extra-extension <path>]");
+	console.error("usage: rpc-smoke.mjs --provider <id> --model <id> [--thinking <level>] [--no-warmup] [--rows <n>] [--cycles <n>] [--extra-extension <path>]");
 	process.exit(2);
 }
 
@@ -95,22 +100,28 @@ const turn = async (message) => {
 try {
 	console.log(el(), "turn 1:", (await turn("Read a.txt, b.txt and c.txt fully with your read tool (three reads) and tell me the SPECIAL record. Be brief.")).toFixed(1), "s");
 	console.log(el(), "turn 2:", (await turn("Remember: the deploy colour is blue. Reply OK.")).toFixed(1), "s");
-	const cs = Date.now();
-	send({ id: "c1", type: "compact" });
-	const r = await until((e) => e.type === "response" && e.id === "c1");
-	const compactS = (Date.now() - cs) / 1000;
-	const end = seen.find((e) => e.type === "compaction_end");
-	console.log(el(), `compact: ${compactS.toFixed(1)}s success=${r.success}`, r.error ?? "");
-	const warmed = (e) => e.type === "extension_ui_request" && /re-warmed/.test(e.message ?? "");
-	if (warmup && !seen.some(warmed)) await until(warmed, 180_000).catch(() => console.log(el(), "no warm-up notice"));
-	const after = await turn("What is the SPECIAL record and the deploy colour? One line.");
-	const last = [...seen].reverse().find((e) => e.type === "agent_end");
-	const answer = JSON.stringify(last?.messages?.at(-1)?.content ?? "").slice(0, 200);
-	console.log(el(), `first turn after compaction: ${after.toFixed(1)}s  answer: ${answer}`);
-	const fromExt = seen.some((e) => e.type === "extension_ui_request" && /Compaction done/.test(e.message ?? ""));
-	console.log(JSON.stringify({ thinking, warmup, compactSeconds: compactS, firstTurnAfterSeconds: after, fromExtension: fromExt, summaryChars: end?.result?.summary?.length }));
+	const notices = (re) => seen.filter((e) => e.type === "extension_ui_request" && re.test(e.message ?? "")).length;
+	const results = [];
+	for (let c = 1; c <= cycles; c++) {
+		if (c > 1) console.log(el(), `cycle ${c} regrow:`, (await turn("Read a.txt, b.txt and c.txt fully again with your read tool (three reads), then reply OK.")).toFixed(1), "s");
+		const cs = Date.now();
+		send({ id: `c${c}`, type: "compact" });
+		const r = await until((e) => e.type === "response" && e.id === `c${c}`);
+		const compactS = (Date.now() - cs) / 1000;
+		const end = [...seen].reverse().find((e) => e.type === "compaction_end");
+		console.log(el(), `compact ${c}: ${compactS.toFixed(1)}s success=${r.success}`, r.error ?? "");
+		if (warmup && notices(/re-warmed/) < c) await until((e) => e.type === "extension_ui_request" && /re-warmed/.test(e.message ?? ""), 180_000).catch(() => console.log(el(), "no warm-up notice"));
+		const after = await turn("What is the SPECIAL record and the deploy colour? One line.");
+		const last = [...seen].reverse().find((e) => e.type === "agent_end");
+		const answer = JSON.stringify(last?.messages?.at(-1)?.content ?? "");
+		const factsOk = /release-2026-09/.test(answer) && /blue/i.test(answer);
+		console.log(el(), `first turn after compaction ${c}: ${after.toFixed(1)}s  facts=${factsOk}  answer: ${answer.slice(0, 200)}`);
+		results.push({ cycle: c, compactSeconds: compactS, firstTurnAfterSeconds: after, fromExtension: notices(/Compaction done/) === c, success: r.success, factsOk, summaryChars: end?.result?.summary?.length });
+	}
+	const ok = results.every((x) => x.fromExtension && x.success && x.factsOk);
+	console.log(JSON.stringify({ thinking, warmup, rows, cycles, ok, results }));
 	pi.kill();
-	process.exit(fromExt && r.success ? 0 : 1);
+	process.exit(ok ? 0 : 1);
 } catch (err) {
 	console.error("smoke failed:", err.message);
 	pi.kill();

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Smoke script: `--cycles N` runs N compact-then-continue rounds in one session and verifies two planted facts after each. Four cycles on DeepSeek, both wire formats, thinking high: every compaction through the extension with a full prefix-cache hit, facts intact.
+
 ## 0.3.0 — 2026-09-20
 
 - **Fix: compaction 401 on authenticated endpoints** ([#2](https://github.com/jagdeepsinghdev/pi-prefix-cache-compaction/issues/2)). `before_provider_headers` runs before Pi hands the API key to the SDK, so the captured header map never contained a credential unless `authHeader: true` was set. The summary request now resolves auth at request time via `ctx.modelRegistry.getApiKeyAndHeaders` and attaches the key the way the SDK does (`x-api-key` for Anthropic Messages, `Authorization: Bearer` for OpenAI and OAuth-style tokens), layered over the captured routing headers; a resolved `baseUrl` is preferred over `model.baseUrl`. A missing credential is reported as `auth: …` instead of an HTTP 401.
