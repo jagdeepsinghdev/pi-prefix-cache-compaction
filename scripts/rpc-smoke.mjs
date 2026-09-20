@@ -6,7 +6,10 @@
  * Isolated: uses a temporary PI_CODING_AGENT_DIR containing only your models.json (and
  * auth.json if present) plus this extension, so other installed extensions do not interfere.
  *
- *   node scripts/rpc-smoke.mjs --provider qwen-local --model qwen3.8-27b [--thinking xhigh] [--no-warmup]
+ *   node scripts/rpc-smoke.mjs --provider qwen-local --model qwen3.8-27b [--thinking xhigh] [--no-warmup] [--rows 700]
+ *
+ * --rows sets the size of each of the three fixture files (700 rows ≈ 15k tokens each, so
+ * ~45k tokens of context before compaction); lower it for slow local servers.
  *
  * Exit code 0 only if the compaction came from this extension.
  */
@@ -25,8 +28,9 @@ const provider = opt("provider");
 const model = opt("model");
 const warmup = !args.includes("--no-warmup");
 const thinking = opt("thinking", "off");
+const rows = Number(opt("rows", "700"));
 if (!provider || !model) {
-	console.error("usage: rpc-smoke.mjs --provider <id> --model <id> [--thinking <level>] [--no-warmup] [--extra-extension <path>]");
+	console.error("usage: rpc-smoke.mjs --provider <id> --model <id> [--thinking <level>] [--no-warmup] [--rows <n>] [--extra-extension <path>]");
 	process.exit(2);
 }
 
@@ -40,9 +44,9 @@ writeFileSync(join(agent, "pi-prefix-cache-compaction.json"), JSON.stringify({ w
 const work = mkdtempSync(join(tmpdir(), "ppcc-work-"));
 const line = (i) => `record ${i}: service=svc${i % 17} owner=team${i % 5} status=${["ok", "degraded", "down"][i % 3]} note=lorem ipsum dolor sit amet consectetur`;
 for (const name of ["a.txt", "b.txt", "c.txt"]) {
-	const rows = Array.from({ length: 700 }, (_, i) => line(i));
-	if (name === "b.txt") rows.splice(350, 0, "record SPECIAL: beta=release-2026-09 deploy=blue");
-	writeFileSync(join(work, name), rows.join("\n"));
+	const lines = Array.from({ length: rows }, (_, i) => line(i));
+	if (name === "b.txt") lines.splice(Math.floor(rows / 2), 0, "record SPECIAL: beta=release-2026-09 deploy=blue");
+	writeFileSync(join(work, name), lines.join("\n"));
 }
 
 const piArgs = ["--mode", "rpc", "--provider", provider, "--model", model, "--thinking", thinking, "--no-session", "-e", join(root, "src", "index.ts")];

@@ -15,12 +15,11 @@
  *  3. after compaction, optionally sends a 1-token warm-up with the new context so the
  *     next turn does not prefill the summary + kept messages cold.
  *
+ * Works for the Anthropic Messages and OpenAI Chat Completions wire formats.
  * Anything unexpected returns nothing, and Pi runs its default compaction.
  * Technique credit: pisceslailai/deepseek-kvcache (MIT), adapted to Anthropic Messages.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -31,15 +30,18 @@ import {
 	buildSummaryBody,
 	buildWarmupBody,
 	type Config,
+	createCollector,
+	endpointUrl,
 	fileListSuffix,
 	isCapturable,
 	mergeConfig,
-	messagesUrl,
 	modelKey,
 	requestHeaders,
-	SseCollector,
+	type ResolvedAuth,
+	streamMessages,
 	summaryTokenBudget,
 	toPiUsage,
+	wireApi,
 } from "./core.ts";
 
 const CONFIG_NAME = "pi-prefix-cache-compaction.json";
@@ -70,7 +72,25 @@ type Capture = {
 	stale?: boolean;
 };
 
-const stats = { compactions: 0, fallbacks: 0, warmups: 0, lastSeconds: 0, lastReason: "" };
+const stats = { compactions: 0, fallbacks: 0, warmups: 0, lastSeconds: 0, lastReason: "", lastWarmupError: "" };
+
+/**
+ * Request-time auth, the same way Pi resolves it for a real turn. `before_provider_headers`
+ * sees Pi's header map BEFORE the API key is attached (the key goes to the SDK as `apiKey`),
+ * so the captured headers alone are keyless against any authenticated endpoint (issue #2).
+ * Older Pi builds without `getApiKeyAndHeaders` fall back to the captured map only.
+ */
+async function resolveAuth(ctx: ExtensionContext): Promise<{ auth?: ResolvedAuth; error?: string }> {
+	const registry = ctx.modelRegistry as { getApiKeyAndHeaders?: (m: any) => Promise<any> } | undefined;
+	if (!ctx.model || typeof registry?.getApiKeyAndHeaders !== "function") return {};
+	try {
+		const r = await registry.getApiKeyAndHeaders(ctx.model);
+		if (!r?.ok) return { error: r?.error ?? "auth resolution failed" };
+		return { auth: { apiKey: r.apiKey, headers: r.headers, baseUrl: r.baseUrl } };
+	} catch (err) {
+		return { error: (err as Error).message };
+	}
+}
 
 export default function prefixCacheCompaction(pi: ExtensionAPI) {
 	const captures = new Map<string, Capture>(); // Pi session id -> last real request
@@ -116,7 +136,8 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		const c = cfg(ctx);
-		if (!appliesTo(ctx.model, c)) return;
+		const api = wireApi(ctx.model);
+		if (!api || !appliesTo(ctx.model, c)) return;
 		if (event.reason === "overflow") return; // context already over the window; nothing to reuse
 		const id = ctx.sessionManager.getSessionId();
 		const cap = captures.get(id);
@@ -128,19 +149,24 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 		const budget = summaryTokenBudget(ctx.model?.contextWindow ?? 0, preparation.tokensBefore, c);
 		if (!budget) return fallback(ctx, "not enough room left in the context window");
 
+		const { auth, error } = await resolveAuth(ctx);
+		if (error) return fallback(ctx, `auth: ${error}`);
+
 		const t0 = Date.now();
 		notify(ctx, `Compaction: reusing cached prefix (${preparation.tokensBefore.toLocaleString()} tokens)`);
 		try {
 			const { text, usage } = await streamMessages(
-				messagesUrl(ctx.model?.baseUrl),
-				requestHeaders(cap.headers, { "x-session-id": id }),
-				JSON.stringify(buildSummaryBody(cap.payload, budget)),
+				endpointUrl(auth?.baseUrl ?? ctx.model?.baseUrl, api),
+				requestHeaders(api, cap.headers, auth, { "x-session-id": id }, ctx.model?.headers),
+				JSON.stringify(buildSummaryBody(cap.payload, budget, api)),
+				createCollector(api),
 				signal,
 			);
 			const secs = Math.round((Date.now() - t0) / 1000);
 			stats.compactions++;
 			stats.lastSeconds = secs;
-			notify(ctx, `Compaction done in ${secs}s (${usage.output_tokens ?? "?"} tokens out)`);
+			const cached = usage.cache_read_input_tokens;
+			notify(ctx, `Compaction done in ${secs}s (${usage.output_tokens ?? "?"} tokens out${cached ? `, ${cached.toLocaleString()} prompt tokens served from prefix cache` : ""})`);
 			return {
 				compaction: {
 					summary: text + fileListSuffix(preparation.fileOps),
@@ -170,22 +196,42 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 		try {
 			const session = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
 			const messages = convertToLlm(session.messages);
-			const headers = requestHeaders(cap.headers, { "x-session-id": id });
+			// The captured map only contributes routing / attribution headers; the credential
+			// is resolved at request time, never replayed from the capture (issue #2).
+			const headers = requestHeaders(wireApi(ctx.model)!, cap.headers, undefined, { "x-session-id": id });
+			delete headers["content-type"];
+			const context = { systemPrompt: "", messages, tools: [] };
+			const onPayload = (built: unknown) => buildWarmupBody(cap.payload!, built as Record<string, any>);
 			const t0 = Date.now();
-			await completeSimple(
-				ctx.model,
-				{ systemPrompt: "", messages, tools: [] },
-				{
+			const registry = ctx.modelRegistry as unknown as { streamSimple?: (m: any, c: any, o: any) => { result(): Promise<any> } };
+			let result: { stopReason?: string; errorMessage?: string };
+			if (typeof registry.streamSimple === "function") {
+				// Pi >= 0.86: the registry streams with request-time auth exactly like a real turn.
+				result = await registry.streamSimple(ctx.model, context, { maxTokens: 1, headers, onPayload }).result();
+			} else {
+				// Pi 0.85: the registry facade cannot stream. Resolve auth through it and call the
+				// same pi-ai entrypoint Pi 0.85 uses for its own compaction.
+				const { auth, error } = await resolveAuth(ctx);
+				if (error) throw new Error(`auth: ${error}`);
+				const model = auth?.baseUrl ? { ...ctx.model, baseUrl: auth.baseUrl } : ctx.model;
+				result = await completeSimple(model, context, {
 					maxTokens: 1,
-					headers,
-					apiKey: bearer(headers) ?? "local",
-					onPayload: (built) => buildWarmupBody(cap.payload!, built as Record<string, any>),
-				},
-			);
+					headers: { ...headers, ...(auth?.headers ?? {}) },
+					apiKey: auth?.apiKey,
+					onPayload,
+				});
+			}
+			if (result.stopReason === "error" || result.stopReason === "aborted") {
+				throw new Error(result.errorMessage ?? `stop reason ${result.stopReason}`);
+			}
 			stats.warmups++;
+			stats.lastWarmupError = "";
 			notify(ctx, `Context re-warmed in ${Math.round((Date.now() - t0) / 1000)}s; next turn starts from cache`);
-		} catch {
-			// Warm-up is best effort; the next turn simply prefills normally.
+		} catch (err) {
+			// Warm-up is best effort; the next turn simply prefills normally. The reason is
+			// kept for /prefix-compaction so a silently failing warm-up is diagnosable.
+			stats.lastWarmupError = (err as Error).message ?? String(err);
+			if (process.env.PI_PREFIX_CACHE_DEBUG) console.error(`[pi-prefix-cache-compaction] warm-up failed: ${stats.lastWarmupError}`);
 		}
 	});
 
@@ -196,8 +242,8 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 			config = c;
 			ctx.ui.notify(
 				[
-					`applies to current model: ${appliesTo(ctx.model, c)}`,
-					`cached compactions: ${stats.compactions} (last ${stats.lastSeconds}s), fallbacks: ${stats.fallbacks}${stats.lastReason ? ` (last: ${stats.lastReason})` : ""}, warm-ups: ${stats.warmups}`,
+					`applies to current model: ${appliesTo(ctx.model, c)} (api: ${ctx.model?.api ?? "none"})`,
+					`cached compactions: ${stats.compactions} (last ${stats.lastSeconds}s), fallbacks: ${stats.fallbacks}${stats.lastReason ? ` (last: ${stats.lastReason})` : ""}, warm-ups: ${stats.warmups}${stats.lastWarmupError ? ` (last warm-up error: ${stats.lastWarmupError})` : ""}`,
 					`config: ${JSON.stringify(c)}`,
 					...problems.map((p) => `config problem: ${p}`),
 				].join("\n"),
@@ -205,57 +251,4 @@ export default function prefixCacheCompaction(pi: ExtensionAPI) {
 			);
 		},
 	});
-}
-
-class HttpStatusError extends Error {}
-
-/**
- * POST and collect an Anthropic SSE stream with node:http, not fetch: fetch (undici)
- * aborts a response that sends no bytes for 300 s ("terminated"), which is exactly what
- * a long prefill or thinking phase on a local server looks like. Aborts only on `signal`.
- */
-function streamMessages(url: string, headers: Record<string, string>, body: string, signal: AbortSignal) {
-	return new Promise<ReturnType<SseCollector["finish"]>>((resolve, reject) => {
-		const u = new URL(url);
-		const send = u.protocol === "https:" ? httpsRequest : httpRequest;
-		const req = send(u, { method: "POST", headers: { ...headers, "content-length": Buffer.byteLength(body) } }, (res) => {
-			const status = res.statusCode ?? 0;
-			const sse = new SseCollector();
-			let errBody = "";
-			res.setEncoding("utf8");
-			res.on("data", (chunk: string) => {
-				if (status >= 400) return void (errBody += chunk);
-				try {
-					sse.push(chunk);
-				} catch (err) {
-					req.destroy(err as Error);
-				}
-			});
-			res.on("end", () => {
-				if (status >= 400) return reject(new HttpStatusError(`HTTP ${status} ${errBody.slice(0, 160)}`));
-				try {
-					resolve(sse.finish());
-				} catch (err) {
-					reject(err);
-				}
-			});
-			res.on("error", reject);
-		});
-		req.setTimeout(0);
-		const onAbort = () => req.destroy(new Error("aborted"));
-		// The error listener must exist before the pre-abort check: req.destroy(err) emits
-		// 'error' asynchronously, and with no listener that is an uncaught exception that
-		// kills the process instead of rejecting this promise (graceful cancel).
-		req.on("error", reject);
-		signal.addEventListener("abort", onAbort, { once: true });
-		req.on("close", () => signal.removeEventListener("abort", onAbort));
-		if (signal.aborted) return onAbort();
-		req.end(body);
-	});
-}
-
-function bearer(headers: Record<string, string>): string | undefined {
-	const auth = headers.authorization;
-	if (auth?.toLowerCase().startsWith("bearer ")) return auth.slice(7);
-	return headers["x-api-key"];
 }

@@ -1,6 +1,6 @@
 # pi-prefix-cache-compaction
 
-Faster [Pi](https://github.com/earendil-works/pi) compaction on self-hosted models (vLLM, SGLang, llama.cpp) by reusing the server's **prefix cache** instead of re-reading the whole conversation.
+Faster [Pi](https://github.com/earendil-works/pi) compaction on any model server with automatic prefix caching, self-hosted (vLLM, SGLang, llama.cpp) or hosted (e.g. DeepSeek), by reusing the server's **prefix cache** instead of re-reading the whole conversation. Works with the two wire formats Pi custom providers use: `anthropic-messages` and `openai-completions`.
 
 ## The problem
 
@@ -14,19 +14,21 @@ Measured on 2× RTX 3090 (vLLM, Qwen3.8-27B W4A16, TP=2), across 132 default com
 | Compaction time | 229 s (p90 489 s) | **86 s** at 215k context |
 | First turn after compaction | 69 s | **35 s** without warm-up; **1.8 s** with warm-up (47k-token smoke test, thinking xhigh) |
 
+On a hosted API the win is smaller in seconds but the cache hit is the same: against DeepSeek's API a 56k-token compaction took 3 s with 56,192 of 56,216 prompt tokens served from cache (see [Verified against](#verified-against)).
+
 ## How it works
 
 1. **Capture.** Every real provider request is kept in memory (`before_provider_request`), per session.
-2. **Compact from cache.** On `session_before_compact` the extension re-sends that exact request (same system prompt, tools, messages, thinking settings, auth/routing headers) with one summarize instruction appended. The prefix is byte-for-byte what the server just processed, so only the instruction is prefilled; the time left is generating the summary.
-3. **Warm-up.** After compaction, it sends a 1-token request with the new context (built by Pi's own converter, with the captured system prompt, tools and thinking settings), so the summary and kept messages are already cached when you send the next turn.
+2. **Compact from cache.** On `session_before_compact` the extension re-sends that exact request (same system prompt, tools, messages, thinking settings, routing headers) with one summarize instruction appended. Credentials are resolved at request time through Pi's model registry, exactly as for a real turn, and attached the way the SDK would (`x-api-key` for Anthropic Messages, `Authorization: Bearer` for OpenAI). The prefix is byte-for-byte what the server just processed, so only the instruction is prefilled; the time left is generating the summary.
+3. **Warm-up.** After compaction, it sends a 1-token request through Pi's model registry with the new context (built by Pi's own converter, with the captured system prompt, tools and thinking settings), so the summary and kept messages are already cached when you send the next turn.
 
-**The prompt is never modified, only extended.** The summary request may set `max_tokens` and `stream`; every field that can reach the rendered prompt is copied verbatim and checked before sending (`assertPrefixPreserved`), so a mistake fails fast into Pi's default instead of silently costing a cold re-prefill.
+**The prompt is never modified, only extended.** The summary request may set the output cap (`max_tokens` or `max_completion_tokens`, whichever the captured request used) and the streaming flags; every field that can reach the rendered prompt is copied verbatim and checked before sending (`assertPrefixPreserved`), so a mistake fails fast into Pi's default instead of silently costing a cold re-prefill.
 
 That matters most for thinking, because the toggle differs per model family and servers derive one field from another:
 
 | Model family | Toggle | Default |
 |---|---|---|
-| Qwen3 / Qwen3.x | `chat_template_kwargs.enable_thinking` | on |
+| Qwen3 / Qwen3.x | `chat_template_kwargs.enable_thinking` (or top-level `enable_thinking` on OpenAI endpoints) | on |
 | DeepSeek-V3.1, IBM Granite 3.2 | `chat_template_kwargs.thinking` | off |
 | Gemma 4 | `enable_thinking` or `reasoning_effort` | off |
 | Holo2 | `thinking: false` disables | on |
@@ -38,6 +40,21 @@ The summary request uses `node:http` rather than `fetch`, because `fetch` gives 
 
 Anything unexpected makes it step aside and Pi's default compaction runs: overflow recovery, no captured request yet (e.g. right after `/reload`), a capture that belongs to a different model or to a pre-fallback-compaction history, too little room left in the window, the model trying to call a tool, a summary cut off mid-stream, or any HTTP/stream error.
 
+## Verified against
+
+Each row is a full run of `scripts/rpc-smoke.mjs` (real turns, compaction through this extension, warm-up, one turn after) on the 0.3.0 code. "From cache" is what the server's own usage report said about the summary request.
+
+| Server | Wire format | Pi | Thinking | Prompt tokens from cache |
+|---|---|---|---|---|
+| llama.cpp `--api-key` (401 without key), Qwen3-4B | `anthropic-messages` | 0.86.0 | off | 26,222 / 26,226 |
+| llama.cpp, same server | `openai-completions` | 0.86.0 | off | 26,323 / 26,327 |
+| vLLM, Qwen3.8-27B, Bearer-only proxy | `anthropic-messages` | 0.86.0 | off | hit (vLLM omits the count by default) |
+| vLLM, same | `openai-completions` | 0.86.0 | high | hit (60k tokens compacted in 19 s) |
+| DeepSeek API (`/anthropic`) | `anthropic-messages` | 0.85.1, 0.86.0 | off, high | 56,192 / 56,216 |
+| DeepSeek API (`/v1`) | `openai-completions` | 0.85.1, 0.86.0 | off, high | 56,192 / 56,313 |
+
+Not verified: SGLang (untested here; its OpenAI-compatible endpoint should behave like vLLM's), `openai-responses` (unsupported), and long multi-compaction sessions on the OpenAI path, which has hours rather than weeks of use behind it.
+
 ## Related work
 
 The same idea, appending the summarize instruction to the last real request so the prefix stays cached, exists for other wire formats:
@@ -45,12 +62,12 @@ The same idea, appending the summarize instruction to the last real request so t
 - [pisceslailai/deepseek-kvcache](https://github.com/pisceslailai/deepseek-kvcache): DeepSeek's hosted API (OpenAI wire format). Technique credit for this package.
 - [yuan-/pi-kvc](https://github.com/yuan-/pi-kvc): llama.cpp / LM Studio over `openai-completions`, with a manual `/kvc` command.
 
-Neither is on npm and neither covers `anthropic-messages`, which is what Pi custom providers for vLLM, SGLang and llama.cpp typically use. This package adds the Anthropic Messages payload handling, the model-bound and stale-capture checks, the prefix-preservation assertion and the post-compaction warm-up.
+Neither is on npm. This package covers both `anthropic-messages` and `openai-completions`, and adds the model-bound and stale-capture checks, the prefix-preservation assertion, request-time credential resolution and the post-compaction warm-up.
 
 ## Requirements
 
-- Pi coding-agent ≥ 0.85 (tested on 0.85.1), Node ≥ 22.19.
-- A custom provider with `"api": "anthropic-messages"` pointing at a server with automatic prefix caching (vLLM `--enable-prefix-caching`, SGLang RadixAttention, llama.cpp `--cache-reuse`).
+- Pi coding-agent ≥ 0.85 (tested on 0.85.1 and 0.86.0), Node ≥ 22.19.
+- A custom provider with `"api": "anthropic-messages"` or `"api": "openai-completions"` pointing at a server with automatic prefix caching (vLLM `--enable-prefix-caching`, SGLang RadixAttention, llama.cpp `--cache-reuse`). Authenticated endpoints work with the key configured as `apiKey` in `models.json`; `authHeader: true` is not required.
 - A chat template that renders earlier turns the same whether or not a new user message follows. Templates that strip earlier reasoning after a new user message (for example Qwen3 with `preserve_thinking` off) still work, with a smaller cache hit.
 
 ## Install
@@ -84,8 +101,8 @@ Optional JSON, project overrides global:
 }
 ```
 
-- `providers` / `baseUrlIncludes`: restrict to specific providers or endpoints (empty = every `anthropic-messages` model not excluded).
-- `baseUrlExcludes`: hosted Anthropic is excluded by default; it has its own caching rules.
+- `providers` / `baseUrlIncludes`: restrict to specific providers or endpoints (empty = every `anthropic-messages` or `openai-completions` model not excluded).
+- `baseUrlExcludes`: hosted Anthropic is excluded by default because its prompt caching needs explicit `cache_control` breakpoints, which this extension does not manage. Hosted APIs with automatic prefix caching work as-is (DeepSeek verified on both wire formats).
 - There is **no option to change thinking for the summary**, by design — see below.
 - The summary budget is `min(maxSummaryTokens, contextWindow − tokensBefore − promptOverheadTokens)`; below `minSummaryTokens` Pi's default runs instead.
 
@@ -93,29 +110,31 @@ Optional JSON, project overrides global:
 
 ```
 Compaction: reusing cached prefix (215,275 tokens)
-Compaction done in 86s (4461 tokens out)
+Compaction done in 86s (4461 tokens out, 214,900 prompt tokens served from prefix cache)
 Context re-warmed in Ns; next turn starts from cache
 ```
 
+The cache count comes from the server's usage report: DeepSeek and llama.cpp include it; vLLM only when started with `--enable-prompt-tokens-details` (the compaction still hits the cache without it, the number is just omitted). If the endpoint rejects the request you get one line and Pi's default runs, e.g. `Prefix-cache compaction skipped (HTTP 401 ...); using Pi default`. A missing credential shows up as `auth: No API key found for "<provider>"` instead of an HTTP error.
+
 ## Limits
 
-- Anthropic Messages wire format only (not `openai-completions` yet).
+- Anthropic Messages and OpenAI Chat Completions only; `openai-responses` and other wire formats fall through to Pi's default. Pi's built-in hosted OpenAI provider uses `openai-responses`, so hosted GPT models are not covered. The OpenAI Chat Completions path is new in 0.3.0 (see [Verified against](#verified-against)); any malformed request falls back to Pi's default rather than failing the compaction.
 - The capture lives in memory: the first compaction after starting or `/reload`, before any turn is sent, uses Pi's default.
 - Switching the model mid-session invalidates the capture (different model means a different cache): the next compaction uses Pi's default until the new model sends a real turn.
 - After falling back to Pi's default compaction, the capture is marked stale until a real turn re-anchors it, so two consecutive compactions without a turn in between use the default both times. The warm-up still runs after such a default compaction.
 - The summary covers the whole captured request, including the recent messages Pi keeps verbatim, so it can repeat a little of that tail.
 - The warm-up uses Pi's `convertToLlm`, not other extensions' `context` transforms; if you use such extensions the warm-up may only partly hit.
 - A user message containing the literal `<conversation>` tag is not captured (same text as Pi's own summarizer requests); the previous turn stays the anchor instead.
-- The warm-up imports `completeSimple` from `@earendil-works/pi-ai/compat`, the same entrypoint Pi 0.85 uses for its own compaction. Pi documents it as a transitional API, so a future Pi may need a small update here; the summary path itself uses plain `node:http` and is unaffected.
+- The warm-up goes through `ctx.modelRegistry.streamSimple` (Pi ≥ 0.86) or pi-ai's `completeSimple` with auth from `getApiKeyAndHeaders` (Pi 0.85), so the credential is resolved at request time either way. A failed warm-up is silent in the UI (the next turn simply prefills normally); `/prefix-compaction` shows the last warm-up error, and `PI_PREFIX_CACHE_DEBUG=1` prints it to stderr.
 
 ## Development
 
 ```bash
 npm test                     # unit tests (node --test, no Pi needed)
-node scripts/rpc-smoke.mjs --provider <id> --model <id> [--thinking xhigh] [--no-warmup]
+node scripts/rpc-smoke.mjs --provider <id> --model <id> [--thinking xhigh] [--no-warmup] [--rows 700]
 ```
 
-The smoke test runs Pi in RPC mode in an isolated agent directory against your real server, compacts a ~60k-token session and times the first turn after.
+The smoke test runs Pi in RPC mode in an isolated agent directory against your real server, compacts a ~45k-token session (`--rows` scales it; 300 is comfortable for a laptop llama.cpp) and times the first turn after. `PI_BIN` selects another Pi binary, `PI_CODING_AGENT_DIR` another `models.json`.
 
 ## License
 
