@@ -1,6 +1,6 @@
 # pi-prefix-cache-compaction
 
-Faster [Pi](https://github.com/earendil-works/pi) compaction on any model server with automatic prefix caching, self-hosted (vLLM, SGLang, llama.cpp) or hosted (e.g. DeepSeek), by reusing the server's **prefix cache** instead of re-reading the whole conversation. Works with the two wire formats Pi custom providers use: `anthropic-messages` and `openai-completions`.
+Faster [Pi](https://github.com/earendil-works/pi) compaction on any model server with automatic prefix caching, self-hosted (vLLM, SGLang, llama.cpp, oMLX) or hosted (e.g. DeepSeek), by reusing the server's **prefix cache** instead of re-reading the whole conversation. Works with the two wire formats Pi custom providers use: `anthropic-messages` and `openai-completions`.
 
 ## The problem
 
@@ -52,10 +52,21 @@ Each row is a full run of `scripts/rpc-smoke.mjs` (real turns, compaction throug
 | vLLM, same | `openai-completions` | 0.86.0 | high | hit (60k tokens compacted in 19 s) |
 | DeepSeek API (`/anthropic`) | `anthropic-messages` | 0.85.1, 0.86.0 | off, high | 56,192 / 56,216 |
 | DeepSeek API (`/v1`) | `openai-completions` | 0.85.1, 0.86.0 | off, high | 56,192 / 56,313 |
+| oMLX (Apple Silicon, MPS), Qwen3.8-27B AWQ | `openai-completions` | 0.87.0 | off | 18,432 / 18,981 |
+| oMLX, same stack, live coding session | `openai-completions` | 0.87.0 | adaptive | 131,072 / 135,414 |
+
+The two oMLX rows were run with Pi 0.87.0 in RPC mode in an isolated `PI_CODING_AGENT_DIR` against oMLX 0.6.4 (engines mlx 0.32.0 locally and 0.31.3 on the second Apple Silicon host): the first is a scripted smoke (compaction at `reason: "threshold"` went through the extension, warm-up included), the second a real `/compact` in an everyday long-running session on `qwen3.8-flash` with thinking `adaptive` — 96.8% of the 135k-token summary request was served from cache. oMLX specifics worth knowing:
+
+- Prefix caching is **on by default, no flag** (hot RAM + an SSD tier). Cache blocks are chain-hashed 2,048-token units, which is why the cache counts above are exact multiples of 2,048 with only the tail cold — and why an appended instruction keeps the hit.
+- Cached blocks **survive model unload/reload** (and a server restart): the first compaction after a reload still hits the SSD tier.
+- `usage.prompt_tokens_details.cached_tokens` is reported on the OpenAI wire, including over SSE, on both engine versions — no extra server flag is needed to see the cache count.
+- For block-level verification oMLX exposes `/admin/api/cache/probe` (and `cache/stats` / `cache/efficiency`), which uses the scheduler's own block hashing.
 
 Multi-compaction sessions: `--cycles 4` on DeepSeek, both wire formats, thinking high. All eight compactions went through the extension with a full cache hit (44,672 to 68,864 prompt tokens served from cache per request), and two planted facts survived every summary-of-a-summary.
 
 Not verified: SGLang (needs an NVIDIA GPU; not run here). Not implemented: `openai-responses`, a different payload and stream format, which is what Pi's built-in hosted OpenAI provider uses.
+
+Not verified on oMLX: multi-compaction `--cycles` runs (single compactions, incl. one live long session, are covered above).
 
 ## Related work
 
@@ -68,8 +79,8 @@ Neither is on npm. This package covers both `anthropic-messages` and `openai-com
 
 ## Requirements
 
-- Pi coding-agent ≥ 0.85 (tested on 0.85.1 and 0.86.0), Node ≥ 22.19.
-- A custom provider with `"api": "anthropic-messages"` or `"api": "openai-completions"` pointing at a server with automatic prefix caching (vLLM `--enable-prefix-caching`, SGLang RadixAttention, llama.cpp `--cache-reuse`). Authenticated endpoints work with the key configured as `apiKey` in `models.json`; `authHeader: true` is not required.
+- Pi coding-agent ≥ 0.85 (tested on 0.85.1, 0.86.0 and 0.87.0), Node ≥ 22.19.
+- A custom provider with `"api": "anthropic-messages"` or `"api": "openai-completions"` pointing at a server with automatic prefix caching (vLLM `--enable-prefix-caching`, SGLang RadixAttention, llama.cpp `--cache-reuse`, oMLX by default). Authenticated endpoints work with the key configured as `apiKey` in `models.json`; `authHeader: true` is not required.
 - A chat template that renders earlier turns the same whether or not a new user message follows. Templates that strip earlier reasoning after a new user message (for example Qwen3 with `preserve_thinking` off) still work, with a smaller cache hit.
 
 ## Install
@@ -116,7 +127,7 @@ Compaction done in 86s (4461 tokens out, 214,900 prompt tokens served from prefi
 Context re-warmed in Ns; next turn starts from cache
 ```
 
-The cache count comes from the server's usage report: DeepSeek and llama.cpp include it; vLLM only when started with `--enable-prompt-tokens-details` (the compaction still hits the cache without it, the number is just omitted). If the endpoint rejects the request you get one line and Pi's default runs, e.g. `Prefix-cache compaction skipped (HTTP 401 ...); using Pi default`. A missing credential shows up as `auth: No API key found for "<provider>"` instead of an HTTP error.
+The cache count comes from the server's usage report: DeepSeek, llama.cpp and oMLX include it; vLLM only when started with `--enable-prompt-tokens-details` (the compaction still hits the cache without it, the number is just omitted). If the endpoint rejects the request you get one line and Pi's default runs, e.g. `Prefix-cache compaction skipped (HTTP 401 ...); using Pi default`. A missing credential shows up as `auth: No API key found for "<provider>"` instead of an HTTP error.
 
 ## Limits
 
