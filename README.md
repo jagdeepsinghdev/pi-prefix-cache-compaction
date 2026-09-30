@@ -54,7 +54,7 @@ Each row is a full run of `scripts/rpc-smoke.mjs` (real turns, compaction throug
 | DeepSeek API (`/v1`) | `openai-completions` | 0.85.1, 0.86.0 | off, high | 56,192 / 56,313 |
 | oMLX (Apple Silicon, MPS), Qwen3.8-27B AWQ | `openai-completions` | 0.87.0 | off | 18,432 / 18,981 |
 | oMLX, same stack, live coding session | `openai-completions` | 0.87.0 | adaptive | 131,072 / 135,414 |
-| LiteLLM proxy → local vLLM, Qwen3.8-27B (2× RTX 3090, TP=2) | `anthropic-messages` | 0.99.1 | off | full hit, 2 cycles, 51,643 / 56,934 prompt |
+| LiteLLM proxy → local vLLM, Qwen3.8-27B (2× RTX 3090, TP=2) | `anthropic-messages` | 0.99.1 | off | 3 cycles, 51.6–56.9k prompt (proxy strips the cache count) |
 
 The two oMLX rows were run with Pi 0.87.0 in RPC mode in an isolated `PI_CODING_AGENT_DIR` against oMLX 0.6.4 (engines mlx 0.32.0 locally and 0.31.3 on the second Apple Silicon host): the first is a scripted smoke (compaction at `reason: "threshold"` went through the extension, warm-up included), the second a real `/compact` in an everyday long-running session on `qwen3.8-flash` with thinking `adaptive` — 96.8% of the 135k-token summary request was served from cache. oMLX specifics worth knowing:
 
@@ -81,6 +81,7 @@ Neither is on npm. This package covers both `anthropic-messages` and `openai-com
 ## Requirements
 
 - Pi coding-agent ≥ 0.85 (tested on 0.85.1, 0.86.0, 0.87.0 and 0.99.1), Node ≥ 22.19.
+- Caveat: a proxy in between (e.g. LiteLLM) may strip `usage.prompt_tokens_details`/`cache_creation` from responses — the extension still works (the server-side prefix cache is unaffected), but the "served from prefix cache" count in the notices will be absent.
 - A custom provider with `"api": "anthropic-messages"` or `"api": "openai-completions"` pointing at a server with automatic prefix caching (vLLM `--enable-prefix-caching`, SGLang RadixAttention, llama.cpp `--cache-reuse`, oMLX by default). Authenticated endpoints work with the key configured as `apiKey` in `models.json`; `authHeader: true` is not required.
 - A chat template that renders earlier turns the same whether or not a new user message follows. Templates that strip earlier reasoning after a new user message (for example Qwen3 with `preserve_thinking` off) still work, with a smaller cache hit.
 
