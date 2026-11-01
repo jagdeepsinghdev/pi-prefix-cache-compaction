@@ -24,13 +24,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No registry-url: it writes an .npmrc with a placeholder NODE_AUTH_TOKEN, which npm
+      # then sends instead of the OIDC token. Node 24 ships npm >= 11.5.1 (trusted publishing).
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
 
-      # Trusted publishing needs npm >= 11.5.1.
-      - run: npm install -g npm@latest
+      - name: OIDC token available
+        run: |
+          npm --version
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "::error::no OIDC token: the job needs 'id-token: write' permission"
+            exit 1
+          fi
 
       - name: Check version tag
         id: ver
@@ -49,7 +55,7 @@ jobs:
 
       - run: npm test
 
-      - run: npm publish
+      - run: npm publish --loglevel verbose
 
       # A tag pushed with GITHUB_TOKEN does not trigger this workflow again.
       - name: Push release tag (manual runs)
