@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-11-01
 
 - **Feature: `models` config** restricts the extension to specific models (`id` or `provider/id`; empty = any), for gateways that serve several models from one base URL, e.g. local Qwen through the same proxy as hosted Claude/GPT models that should keep Pi's default compaction.
 
