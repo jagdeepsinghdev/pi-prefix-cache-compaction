@@ -1,4 +1,6 @@
-# Publishes to npm when a version tag (v*) is pushed.
+# Publishes to npm when a version tag (v*) is pushed, or when run manually from the
+# Actions tab (publishes the package.json version from the selected branch, then pushes
+# the matching v<version> tag).
 # Uses npm trusted publishing (OIDC): no NPM_TOKEN secret. The trusted publisher must be
 # configured on npmjs.com for this repo with workflow file "publish.yml".
 name: publish
@@ -6,9 +8,10 @@ name: publish
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # push the release tag on manual runs
   id-token: write # OIDC token for npm trusted publishing (also enables provenance)
 
 concurrency:
@@ -29,14 +32,28 @@ jobs:
       # Trusted publishing needs npm >= 11.5.1.
       - run: npm install -g npm@latest
 
-      - name: Tag must match package.json version
+      - name: Check version tag
+        id: ver
         run: |
-          pkg="v$(node -p "require('./package.json').version")"
-          if [ "$pkg" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $pkg"
+          tag="v$(node -p "require('./package.json').version")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "$tag" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match package.json version $tag"
+              exit 1
+            fi
+          elif git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::tag $tag already exists; bump package.json version first"
             exit 1
           fi
 
       - run: npm test
 
       - run: npm publish
+
+      # A tag pushed with GITHUB_TOKEN does not trigger this workflow again.
+      - name: Push release tag (manual runs)
+        if: github.ref_type != 'tag'
+        run: |
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin "${{ steps.ver.outputs.tag }}"
