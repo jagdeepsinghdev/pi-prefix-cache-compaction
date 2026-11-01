@@ -55,6 +55,14 @@ test("appliesTo: anthropic-messages and openai-completions local servers by defa
 	assert.equal(appliesTo(local, mergeConfig({ baseUrlIncludes: [":9999"] })), false);
 });
 
+test("appliesTo: models matches id or provider/id", () => {
+	const m = { provider: "gw", id: "big", api: "openai-completions", baseUrl: "http://gw:1/v1" };
+	assert.equal(appliesTo(m, mergeConfig({ models: ["big"] })), true);
+	assert.equal(appliesTo(m, mergeConfig({ models: ["gw/big"] })), true);
+	assert.equal(appliesTo(m, mergeConfig({ models: ["other", "gw/small"] })), false);
+	assert.equal(appliesTo(m, mergeConfig({ models: [] })), true);
+});
+
 test("isCapturable: real turns yes, Pi's fallback summarizer and empty payloads no", () => {
 	assert.equal(isCapturable({ system: "You are pi", messages: [{ role: "user", content: "hi" }] }), true);
 	assert.equal(

@@ -13,6 +13,8 @@ export interface Config {
 	baseUrlIncludes: string[];
 	/** Never apply when the baseUrl contains one of these (hosted APIs have their own caching). */
 	baseUrlExcludes: string[];
+	/** Apply only to these models, as `id` or `provider/id` (empty = any). */
+	models: string[];
 	maxSummaryTokens: number;
 	minSummaryTokens: number;
 	/** Tokens reserved for the appended instruction and chat-template overhead. */
@@ -54,6 +56,7 @@ export const DEFAULT_CONFIG: Config = {
 	providers: [],
 	baseUrlIncludes: [],
 	baseUrlExcludes: ["api.anthropic.com"],
+	models: [],
 	maxSummaryTokens: 16_000,
 	minSummaryTokens: 4_000,
 	promptOverheadTokens: 3_000,
@@ -115,6 +118,7 @@ export function appliesTo(model: ModelLike | undefined, cfg: Config): boolean {
 	if (cfg.baseUrlExcludes.some((s) => s && url.includes(s))) return false;
 	if (cfg.providers.length && !cfg.providers.includes(String(model.provider))) return false;
 	if (cfg.baseUrlIncludes.length && !cfg.baseUrlIncludes.some((s) => url.includes(s))) return false;
+	if (cfg.models.length && !cfg.models.includes(String(model.id)) && !cfg.models.includes(`${model.provider}/${model.id}`)) return false;
 	return true;
 }
 

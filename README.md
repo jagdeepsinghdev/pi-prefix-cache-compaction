@@ -142,6 +142,7 @@ Optional JSON, project overrides global:
   "providers": [],
   "baseUrlIncludes": [],
   "baseUrlExcludes": ["api.anthropic.com"],
+  "models": [],
   "maxSummaryTokens": 16000,
   "minSummaryTokens": 4000,
   "promptOverheadTokens": 3000,
@@ -156,6 +157,7 @@ Optional JSON, project overrides global:
 ```
 
 - `providers` / `baseUrlIncludes`: restrict to specific providers or endpoints (empty = every `anthropic-messages` or `openai-completions` model not excluded).
+- `models`: restrict to specific models, as `id` or `provider/id` (empty = any), for providers that serve several models from one endpoint.
 - `baseUrlExcludes`: hosted Anthropic is excluded by default because its prompt caching needs explicit `cache_control` breakpoints, which this extension does not manage. Hosted APIs with automatic prefix caching work as-is (DeepSeek verified on both wire formats).
 - There is **no option to change thinking for the summary**, by design — see below.
 - The summary budget is `min(maxSummaryTokens, contextWindow − tokensBefore − promptOverheadTokens)`; below `minSummaryTokens` Pi's default runs instead.
