@@ -1,5 +1,7 @@
 # pi-prefix-cache-compaction
 
+[![](https://data.jsdelivr.com/v1/package/npm/pi-prefix-cache-compaction/badge?style=rounded)](https://www.jsdelivr.com/package/npm/pi-prefix-cache-compaction)
+
 Faster [Pi](https://github.com/earendil-works/pi) compaction on any model server with automatic prefix caching, self-hosted (vLLM, SGLang, llama.cpp, oMLX) or hosted (e.g. DeepSeek), by reusing the server's **prefix cache** instead of re-reading the whole conversation. Works with the two wire formats Pi custom providers use: `anthropic-messages` and `openai-completions`.
 
 Optional background mode (0.5.0) prepares the summary and the post-compaction cache before Pi compacts. Measured on a local 27B model, Pi's auto-compaction then took 0.1–3 s instead of minutes; when the background work is not finished yet, Pi waits for the remainder (see [Limits](#limits)).
