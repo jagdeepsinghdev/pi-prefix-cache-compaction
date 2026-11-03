@@ -55,7 +55,7 @@ Anything unexpected makes it step aside and Pi's default compaction runs: overfl
 
 ## Verified against
 
-Each row is a full run of `scripts/rpc-smoke.mjs` (real turns, compaction through this extension, warm-up, one turn after) on the 0.3.0 code. "From cache" is what the server's own usage report said about the summary request.
+Each row is a full run of `scripts/rpc-smoke.mjs` (real turns, compaction through this extension, warm-up, one turn after) on 0.3.0 or later code. "From cache" is what the server's own usage report said about the summary request.
 
 | Server | Wire format | Pi | Thinking | Prompt tokens from cache |
 |---|---|---|---|---|
@@ -161,7 +161,7 @@ Optional JSON, project overrides global:
 - `providers` / `baseUrlIncludes`: restrict to specific providers or endpoints (empty = every `anthropic-messages` or `openai-completions` model not excluded).
 - `models`: restrict to specific models, as `id` or `provider/id` (empty = any), for providers that serve several models from one endpoint.
 - `baseUrlExcludes`: hosted Anthropic is excluded by default because its prompt caching needs explicit `cache_control` breakpoints, which this extension does not manage. Hosted APIs with automatic prefix caching work as-is (DeepSeek verified on both wire formats).
-- There is **no option to change thinking for the summary**, by design — see below.
+- There is **no option to change thinking for the summary**, by design — see [How it works](#how-it-works).
 - The summary budget is `min(maxSummaryTokens, contextWindow − tokensBefore − promptOverheadTokens)`; below `minSummaryTokens` Pi's default runs instead.
 - `persist` (0.4.0, on by default): the last captured request per session is also kept on disk in `~/.pi/agent/cache/pi-prefix-cache-compaction/` (credentials are never written; files older than 14 days are pruned). A compaction that fires right after `pi -c` / resume, before any new turn, then replays the request the previous process sent — the prefix the server still has cached — instead of falling back to Pi's default. The file is dropped after every compaction, since it then describes pre-compaction history.
 - `incremental` (0.4.0, **experimental**, off by default): on Pi ≥ 0.99, from the second compaction on Pi hands the extension a `previousSummary` plus a message window that excludes the pre-compaction history. When enabled, the summary request appends that previous summary and an update instruction so the model merges the new delta into the existing summary instead of re-summarizing everything, and the merged result is carried into the next compaction. Verified live with `scripts/experiment.mjs experiments/incremental.json`: it merges correctly and kept every planted fact, but two single runs disagreed on speed (−14 % and +44 % summary time), so a speed benefit is not shown and it stays opt-in.
@@ -238,14 +238,22 @@ The cache count comes from the server's usage report: DeepSeek, llama.cpp and oM
 
 ```bash
 npm test                     # unit tests (node --test, no Pi needed)
-node scripts/rpc-smoke.mjs --provider <id> --model <id> [--thinking xhigh] [--no-warmup] [--rows 700] [--cycles 1]
+node scripts/rpc-smoke.mjs --provider <id> --model <id> [--thinking xhigh] [--no-warmup] [--rows 700] [--cycles 1] [--extra-extension <path>]
 node scripts/resume-smoke.mjs --provider <id> --model <id> [--persist false] [--base-url URL --api-key KEY --model-id NAME]
 node scripts/experiment.mjs experiments/incremental.json [--repeats N] [--dry-run]
-node scripts/background-smoke.mjs --provider <id> --model <id> [--window 64000] [--rows 500] [--no-background]
+node scripts/background-smoke.mjs --provider <id> --model <id> [--window 64000] [--rows 500] [--background-at 0.35] [--no-background]
 node scripts/stale-ctx-smoke.mjs --provider <id> --model <id>
+node scripts/bench-cycles.mjs --provider <id> --model <id> [--thinking off] [--rows 600] [--cycles 3] [--no-warmup] [--ssh-host <host> --token-log <path>]
 ```
 
-The smoke test runs Pi in RPC mode in an isolated agent directory against your real server, compacts a ~45k-token session (`--rows` scales it; 300 is comfortable for a laptop llama.cpp) and times the first turn after; `--cycles N` repeats compact-then-continue N times in one session and checks two planted facts after each. `experiment.mjs` runs config-driven live A/B experiments (see [`experiments/README.md`](experiments/README.md)): each arm is any overlay of this extension's config, every arm runs the same scripted session (plant a fact per cycle, push it out of the verbatim tail, compact, finally recall every fact), arms interleave over `repeats`, and the exit code is gated on the checks you choose — every compaction used the extension, incremental wiring, no lost facts, and a minimum speed gain of candidate over baseline. `resume-smoke.mjs` checks `persist`: one process runs a short session and quits, a second resumes it with `--continue` and compacts before any turn; it passes only if that compaction went through the extension (or, with `--persist false`, only if it fell back). `--base-url` points it straight at one inference server so it does not take a slot on a shared proxy. `background-smoke.mjs` shrinks the model's context window in a temp `models.json` so Pi's own threshold auto-compaction fires after a few file reads, then reports how long Pi was blocked and whether planted facts survived; `--no-background` runs the same scenario as the baseline. `stale-ctx-smoke.mjs` replaces the session while background work is still running and checks Pi survives (regression test for a crash after `/reload`). `PI_BIN` selects another Pi binary, `PI_CODING_AGENT_DIR` another `models.json`.
+The smoke test runs Pi in RPC mode in an isolated agent directory against your real server, compacts a ~45k-token session (`--rows` scales it; 300 is comfortable for a laptop llama.cpp) and times the first turn after; `--cycles N` repeats compact-then-continue N times in one session and checks two planted facts after each. `experiment.mjs` runs config-driven live A/B experiments (see [`experiments/README.md`](experiments/README.md)): each arm is any overlay of this extension's config, every arm runs the same scripted session (plant a fact per cycle, push it out of the verbatim tail, compact, finally recall every fact), arms interleave over `repeats`, and the exit code is gated on the checks you choose — every compaction used the extension, incremental wiring, no lost facts, and a minimum speed gain of candidate over baseline. `resume-smoke.mjs` checks `persist`: one process runs a short session and quits, a second resumes it with `--continue` and compacts before any turn; it passes only if that compaction went through the extension (or, with `--persist false`, only if it fell back). `--base-url` points it straight at one inference server so it does not take a slot on a shared proxy. `background-smoke.mjs` shrinks the model's context window in a temp `models.json` so Pi's own threshold auto-compaction fires after a few file reads, then reports how long Pi was blocked and whether planted facts survived; `--no-background` runs the same scenario as the baseline. `stale-ctx-smoke.mjs` replaces the session while background work is still running and checks Pi survives (regression test for a crash after `/reload`). `bench-cycles.mjs` times each stage of N compaction cycles (grow, compact, warm-up, first turn after) and, with `--ssh-host`/`--token-log`, reads the server's own token log for that window plus two control requests (cold vs replayed prompt of the same size), for stacks whose proxy strips the cache count. `experiments/summary-length.json` is a second example experiment (summary cap 16k vs 6k). `PI_BIN` selects another Pi binary, `PI_CODING_AGENT_DIR` another `models.json`.
+
+Debugging: `PI_PREFIX_CACHE_DEBUG=1` prints warm-up errors to stderr (summary errors already show as a notice); `PI_PREFIX_CACHE_DUMP=<dir>` writes every captured request and warm-up body to `<dir>` as numbered JSON files, for diffing a cache miss.
+
+### Releasing
+
+1. Bump `version` in `package.json` and add the CHANGELOG section; push to `master`.
+2. Run the **publish** workflow from the Actions tab (or push a `v<version>` tag). It runs the tests, publishes to npm through trusted publishing (no token), and pushes the tag on manual runs.
 
 ## License
 
