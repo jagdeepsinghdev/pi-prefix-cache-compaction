@@ -20,6 +20,7 @@ import {
 	assertPrefixPreserved,
 	PrefixChangedError,
 	SseCollector,
+	summaryStarted,
 	SummaryError,
 	SUMMARY_PROMPT,
 	UPDATE_SUMMARY_PROMPT,
@@ -736,4 +737,76 @@ test("background summary is used only while summary + kept tail leave room", () 
 	assert.equal(backgroundFits(0, 1, 0, 0), false);
 	// estimate noise (tokens now below the summary point) counts as no tail
 	assert.equal(backgroundFits(100_000, 50_000, 60_000, 4_000), true);
+});
+
+// ---- a finished summary followed by a tool call (Qwen3.8 in a tool loop, 2026-11-03) ----
+
+test("summaryStarted: only a `## Goal` heading counts, not a passing mention", () => {
+	assert.equal(summaryStarted("## Goal\n1. x"), true);
+	assert.equal(summaryStarted("\n\n## Goal\n1. x"), true);
+	assert.equal(summaryStarted("I will now write the ## Goal section"), false);
+	assert.equal(summaryStarted("Let me check the file first."), false);
+	assert.equal(summaryStarted(""), false);
+});
+
+test("SseCollector: tool_use AFTER a started summary ends it and keeps the text; before it still refuses", () => {
+	const after = new SseCollector();
+	after.push(
+		sse(
+			{ type: "message_start", message: { usage: { input_tokens: 9, cache_read_input_tokens: 180_000 } } },
+			{ type: "content_block_start", index: 0, content_block: { type: "thinking" } },
+			{ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "summarize" } },
+			{ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "\n\n## Goal\n1. ship it\n\n## Next Steps\n1. verify\n\n" } },
+			{ type: "content_block_start", index: 2, content_block: { type: "tool_use", name: "bash" } },
+			{ type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: '{"cmd":"ls"}' } },
+			{ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 40 } },
+			{ type: "message_stop" },
+		),
+	);
+	assert.equal(after.endedAtTool, true);
+	const r = after.finish();
+	assert.equal(r.text, "## Goal\n1. ship it\n\n## Next Steps\n1. verify");
+	assert.equal(r.stopReason, "tool_use");
+	assert.equal(r.usage.cache_read_input_tokens, 180_000);
+
+	const before = new SseCollector();
+	before.push(sse({ type: "content_block_delta", delta: { type: "text_delta", text: "Let me check first." } }));
+	assert.throws(() => before.push(sse({ type: "content_block_start", content_block: { type: "tool_use", name: "bash" } })), /tried to call a tool/);
+});
+
+test("ChatCompletionsCollector: tool_calls AFTER a started summary ends it and keeps the text; before it still refuses", () => {
+	const after = new ChatCompletionsCollector();
+	after.push(
+		chat(
+			delta({ content: "## Goal\n1. ship it\n" }),
+			delta({ tool_calls: [{ index: 0, id: "t", function: { name: "bash", arguments: "" } }] }),
+			delta({}, "tool_calls"),
+			"[DONE]",
+		),
+	);
+	assert.equal(after.endedAtTool, true);
+	assert.equal(after.finish().text, "## Goal\n1. ship it");
+
+	const before = new ChatCompletionsCollector();
+	assert.throws(() => before.push(chat(delta({ tool_calls: [{ index: 0, id: "t", function: { name: "bash", arguments: "" } }] }))), /tried to call a tool/);
+});
+
+test("streamMessages: resolves with the summary as soon as a trailing tool call starts, without waiting for the stream to end", async () => {
+	let closed = false;
+	const srv = await fakeServer((_req, _body, res) => {
+		res.writeHead(200, { "content-type": "text/event-stream" });
+		res.write(sse({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "## Goal\ndone\n" } }));
+		res.write(sse({ type: "content_block_start", index: 1, content_block: { type: "tool_use", name: "bash" } }));
+		// the server would keep decoding tool arguments; the client must hang up instead
+		res.on("close", () => (closed = true));
+	});
+	try {
+		const r = await streamMessages(endpointUrl(srv.url, "anthropic-messages"), { "content-type": "application/json" }, "{}", new SseCollector(), new AbortController().signal, 5_000);
+		assert.equal(r.text, "## Goal\ndone");
+		assert.equal(r.stopReason, "tool_use");
+		for (let i = 0; i < 50 && !closed; i++) await new Promise((res) => setTimeout(res, 10));
+		assert.equal(closed, true, "connection closed so the server stops decoding");
+	} finally {
+		await srv.close();
+	}
 });

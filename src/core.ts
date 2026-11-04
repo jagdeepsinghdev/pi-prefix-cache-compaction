@@ -486,10 +486,26 @@ export function toPiUsage(u: Record<string, number>): UsageLike {
 
 export class SummaryError extends Error {}
 
+/**
+ * The summary is replayed with the session's full tool list (it must be, for the prefix
+ * cache), and a coding model deep in a tool loop often writes the complete checkpoint and
+ * THEN appends a tool call out of habit (seen 2026-11-03 on Qwen3.8-27B: 12k chars of
+ * `## Goal ...` followed by a `bash` call). Rejecting that threw away finished summaries.
+ * A tool call is therefore only fatal before the summary has started; after a summary
+ * that already has its first section heading it simply ends the summary.
+ */
+const SUMMARY_STARTED = /^\s*##\s+Goal\b/m;
+
+export function summaryStarted(text: string): boolean {
+	return SUMMARY_STARTED.test(text);
+}
+
 /** Incremental SSE parser for one wire format; `push` chunks, then `finish`. */
 export interface StreamCollector {
 	text: string;
 	thinkingChars: number;
+	/** The model moved on to a tool call after a complete-looking summary: stop reading, keep the text. */
+	endedAtTool: boolean;
 	push(chunk: string): void;
 	finish(): SseResult;
 }
@@ -540,6 +556,7 @@ export class ChatCompletionsCollector implements StreamCollector {
 	finishReason = "";
 	/** Saw the terminal `[DONE]` sentinel. */
 	complete = false;
+	endedAtTool = false;
 	usage: Record<string, number> = {};
 
 	push(chunk: string): void {
@@ -548,6 +565,7 @@ export class ChatCompletionsCollector implements StreamCollector {
 
 	finish(): SseResult {
 		this.frames.flush((d) => this.data(d));
+		if (this.endedAtTool) return { text: this.text.trim(), stopReason: "tool_calls", usage: this.usage };
 		if (this.finishReason === "length") throw new SummaryError("summary hit the token cap");
 		if (this.finishReason === "tool_calls" || this.finishReason === "function_call") throw new SummaryError("model tried to call a tool");
 		if (!this.text.trim()) throw new SummaryError("empty summary");
@@ -556,6 +574,7 @@ export class ChatCompletionsCollector implements StreamCollector {
 	}
 
 	private data(data: string): void {
+		if (this.endedAtTool) return; // the summary is over; ignore the tool call's arguments
 		if (data === "[DONE]") return void (this.complete = true);
 		let ev: any;
 		try {
@@ -570,8 +589,11 @@ export class ChatCompletionsCollector implements StreamCollector {
 		if (!ev.usage && choice.usage) this.usage = normalizeChatUsage(choice.usage); // Moonshot puts it here
 		if (choice.finish_reason) this.finishReason = String(choice.finish_reason);
 		const delta = choice.delta ?? {};
-		if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) throw new SummaryError("model tried to call a tool");
 		if (typeof delta.content === "string") this.text += delta.content;
+		if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) {
+			if (!summaryStarted(this.text)) throw new SummaryError("model tried to call a tool");
+			this.endedAtTool = true;
+		}
 		for (const f of ["reasoning_content", "reasoning", "reasoning_text"]) {
 			if (typeof delta[f] === "string" && delta[f].length) {
 				this.thinkingChars += delta[f].length;
@@ -602,6 +624,7 @@ export class SseCollector implements StreamCollector {
 	stopReason = "";
 	/** Saw the terminal `message_stop` event: the server finished, whatever it reported. */
 	complete = false;
+	endedAtTool = false;
 	usage: Record<string, number> = {};
 
 	push(chunk: string): void {
@@ -610,6 +633,7 @@ export class SseCollector implements StreamCollector {
 
 	finish(): SseResult {
 		this.frames.flush((d) => this.data(d));
+		if (this.endedAtTool) return { text: this.text.trim(), stopReason: "tool_use", usage: this.usage };
 		if (this.stopReason === "max_tokens") throw new SummaryError("summary hit the token cap");
 		if (!this.text.trim()) throw new SummaryError("empty summary");
 		// Reject only a stream that was cut off mid-summary: no stop reason AND no terminal
@@ -621,7 +645,7 @@ export class SseCollector implements StreamCollector {
 	}
 
 	private data(data: string): void {
-		if (data === "[DONE]") return;
+		if (this.endedAtTool || data === "[DONE]") return;
 		let ev: any;
 		try {
 			ev = JSON.parse(data);
@@ -630,7 +654,10 @@ export class SseCollector implements StreamCollector {
 		}
 		switch (ev.type) {
 			case "content_block_start":
-				if (ev.content_block?.type === "tool_use") throw new SummaryError("model tried to call a tool");
+				if (ev.content_block?.type === "tool_use") {
+					if (!summaryStarted(this.text)) throw new SummaryError("model tried to call a tool");
+					this.endedAtTool = true;
+				}
 				break;
 			case "content_block_delta":
 				if (ev.delta?.type === "text_delta") this.text += ev.delta.text;
@@ -699,7 +726,17 @@ export function streamMessages(url: string, headers: Record<string, string>, bod
 				try {
 					sse.push(chunk);
 				} catch (err) {
-					req.destroy(err as Error);
+					return void req.destroy(err as Error);
+				}
+				if (sse.endedAtTool) {
+					// Summary complete, the rest is a tool call nobody will run: settle now and hang
+					// up so the server stops decoding (the later 'error'/'close' cannot re-settle).
+					try {
+						resolve(sse.finish());
+					} catch (err) {
+						reject(err);
+					}
+					req.destroy();
 				}
 			});
 			res.on("end", () => {

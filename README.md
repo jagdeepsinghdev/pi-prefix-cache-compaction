@@ -51,7 +51,7 @@ vLLM also injects `enable_thinking` from `reasoning_effort` (`low`/`medium`/`hig
 
 The summary request uses `node:http` rather than `fetch`, because `fetch` gives up on a response that sends no bytes for 300 s, which a long prefill or thinking phase on a local GPU can do. It is still bounded: after 600 s with no bytes at all (a proxy that stopped relaying without closing the connection) it gives up and Pi's default runs, instead of leaving "Auto-compacting" spinning forever.
 
-Anything unexpected makes it step aside and Pi's default compaction runs: overflow recovery, no captured request yet (a fresh session, or `persist` turned off), a capture that belongs to a different model or to a pre-fallback-compaction history, too little room left in the window, the model trying to call a tool, a summary cut off mid-stream, or any HTTP/stream error.
+Anything unexpected makes it step aside and Pi's default compaction runs: overflow recovery, no captured request yet (a fresh session, or `persist` turned off), a capture that belongs to a different model or to a pre-fallback-compaction history, too little room left in the window, the model calling a tool before it starts the summary (a tool call after a summary that has begun with `## Goal` just ends it; the text is kept), a summary cut off mid-stream, or any HTTP/stream error.
 
 ## Verified against
 
