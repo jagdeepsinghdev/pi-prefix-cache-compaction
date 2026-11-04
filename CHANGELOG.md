@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.1 — 2026-11-03
 
 - **Fix: finished summaries were thrown away when the model added a tool call at the end.** The summary request has to carry the session's full tool list (prefix cache), and a coding model deep in a tool loop often writes the complete checkpoint and then calls a tool out of habit. Any `tool_use` block (or `tool_calls` delta) used to reject the whole summary with "model tried to call a tool", which in background mode surfaced as *Background compaction failed (model tried to call a tool)* after minutes of generation. A tool call that comes **after** a summary that has started with its `## Goal` heading now just ends the summary: the text is kept, the connection is closed so the server stops decoding, and the compaction proceeds. A tool call before the summary starts still falls back as before. Found live on Qwen3.8-27B (vLLM, xhigh, 262k window): replaying the exact failed background request gave `thinking, text (12,180 chars, complete), tool_use:bash`. Token-log audit of the previous 7 days: 93 aborted >150k-token requests across both GPU pairs (48 A / 45 B), about one failed background attempt per 2–4 compactions.
 
