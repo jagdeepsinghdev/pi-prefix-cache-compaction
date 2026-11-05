@@ -93,7 +93,7 @@ Neither is on npm. This package covers both `anthropic-messages` and `openai-com
 
 ## Requirements
 
-- Pi coding-agent ≥ 0.85 (tested on 0.85.1, 0.86.0, 0.87.0, 0.99.1 and 1.1.0), Node ≥ 22.19. Background mode and the status pill were tested on 1.1.0.
+- Pi coding-agent ≥ 0.85 (tested on 0.85.1, 0.86.0, 0.87.0, 0.99.1, 1.1.0 and 1.4.0), Node ≥ 22.19. Background mode and the status pill were tested on 1.1.0 and 1.4.0.
 - Caveat: a proxy in between (e.g. LiteLLM) may strip `usage.prompt_tokens_details`/`cache_creation` from responses — the extension still works (the server-side prefix cache is unaffected), but the "served from prefix cache" count in the notices will be absent.
 - A custom provider with `"api": "anthropic-messages"` or `"api": "openai-completions"` pointing at a server with automatic prefix caching (vLLM `--enable-prefix-caching`, SGLang RadixAttention, llama.cpp `--cache-reuse`, oMLX by default). Authenticated endpoints work with the key configured as `apiKey` in `models.json`; `authHeader: true` is not required.
 - A chat template that renders earlier turns the same whether or not a new user message follows. Templates that strip earlier reasoning after a new user message (for example Qwen3 with `preserve_thinking` off) still work, with a smaller cache hit.
@@ -122,6 +122,7 @@ Then `/reload` open sessions (or restart them). Existing config files keep worki
 | 0.4.0 | Summaries are shorter (prompt asks for ~1,000–1,500 words). | — |
 | 0.4.0 | A summary stream that sends nothing for 600 s is abandoned and Pi's default runs (was: hung forever). | — |
 | 0.5.0 | A status pill in Pi's footer while a compaction, warm-up or background summary runs. | `"statusBar": false` |
+| 0.6.1 | A summary that the model ends with a tool call is kept (was: discarded, "model tried to call a tool"). A tool call before the summary starts still falls back. | — |
 
 Background mode is off by default. To turn it on, add it to `~/.pi/agent/pi-prefix-cache-compaction.json` (all projects) or `<project>/.pi/pi-prefix-cache-compaction.json` (one project), then `/reload`:
 
