@@ -696,7 +696,17 @@ export function fileListSuffix(fileOps: { read?: Iterable<string>; edited?: Iter
 export function buildWarmupBody(captured: Record<string, any>, built: Record<string, any>): Record<string, any> {
 	// Everything except `messages` comes from the captured turn, so the warmed prefix is the
 	// one the next real turn will send. A 1-token cap is fine: the server stops at max_tokens.
-	const body: Record<string, any> = { ...captured, messages: built.messages, stream: built.stream ?? true };
+	// OpenAI Chat Completions carries the system prompt as leading messages, and the warm-up
+	// is built with an empty system prompt (pi-ai then omits it), so restore them from the
+	// capture; without them the warm-up misses from its first token.
+	const builtMessages: any[] = Array.isArray(built.messages) ? built.messages : [];
+	const leadingSystem: any[] = [];
+	for (const m of Array.isArray(captured.messages) ? captured.messages : []) {
+		if (!isSystemRole(m)) break;
+		leadingSystem.push(m);
+	}
+	const messages = builtMessages.length && isSystemRole(builtMessages[0]) ? builtMessages : [...leadingSystem, ...builtMessages];
+	const body: Record<string, any> = { ...captured, messages, stream: built.stream ?? true };
 	setMaxTokens(body, captured, 1);
 	for (const key of PROMPT_AFFECTING_KEYS) {
 		if (key !== "messages") body[key] = captured[key];
