@@ -304,6 +304,16 @@ test("buildWarmupBody (openai-completions): 1 token in the captured cap field", 
 	assert.equal(body.max_tokens, undefined);
 });
 
+test("buildWarmupBody (openai-completions): captured leading system messages are restored", () => {
+	const system = { role: "system", content: "S" };
+	const captured = { model: "m", messages: [system, { role: "developer", content: "D" }, { role: "user", content: "old" }, { role: "system", content: "late" }] };
+	const built = buildWarmupBody(captured, { messages: [{ role: "user", content: "new" }] });
+	assert.deepEqual(built.messages, [system, { role: "developer", content: "D" }, { role: "user", content: "new" }]);
+	// A builder that already rendered a system prompt is left alone.
+	const own = buildWarmupBody(captured, { messages: [{ role: "system", content: "X" }, { role: "user", content: "new" }] });
+	assert.deepEqual(own.messages, [{ role: "system", content: "X" }, { role: "user", content: "new" }]);
+});
+
 const chat = (...chunks: Array<object | string>) => chunks.map((c) => `data: ${typeof c === "string" ? c : JSON.stringify(c)}\n\n`).join("");
 const delta = (d: Record<string, unknown>, finish_reason: string | null = null) => ({ id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: d, finish_reason }] });
 
